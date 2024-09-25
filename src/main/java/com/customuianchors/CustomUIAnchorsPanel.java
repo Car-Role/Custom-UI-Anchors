@@ -36,9 +36,12 @@ public class CustomUIAnchorsPanel extends PluginPanel
 	private void updateAnchorList()
 	{
 		anchorListPanel.removeAll();
-		for (UIAnchor anchor : config.anchors())
-		{
-			anchorListPanel.add(createAnchorPanel(anchor));
+		List<UIAnchor> anchors = config.anchors();
+		if (anchors != null) {
+			for (UIAnchor anchor : anchors)
+			{
+				anchorListPanel.add(createAnchorPanel(anchor));
+			}
 		}
 		anchorListPanel.revalidate();
 		anchorListPanel.repaint();
