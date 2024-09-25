@@ -5,6 +5,8 @@ import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import java.util.List;
 import java.util.ArrayList;
+import com.google.gson.reflect.TypeToken;
+import net.runelite.client.config.ConfigSection;
 
 @ConfigGroup("customuianchors")
 public interface CustomUIAnchorsConfig extends Config
@@ -35,4 +37,9 @@ public interface CustomUIAnchorsConfig extends Config
             description = "Set the list of UI anchors"
     )
     void setAnchors(List<UIAnchor> anchors);
+
+    // Add this method to help with JSON serialization/deserialization
+    default TypeToken<List<UIAnchor>> getAnchorListType() {
+        return new TypeToken<List<UIAnchor>>() {};
+    }
 }
