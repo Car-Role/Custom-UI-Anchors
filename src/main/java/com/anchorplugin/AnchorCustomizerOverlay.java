@@ -37,6 +37,15 @@ public class AnchorCustomizerOverlay extends Overlay {
         setPosition(OverlayPosition.DYNAMIC);
         setLayer(OverlayLayer.ABOVE_WIDGETS);
         setPriority(100.0f); // High priority
+        setDragTargetable(true); // Allow other overlays to be dragged onto this
+    }
+
+    @Override
+    public boolean onDrag(Overlay other) {
+        // Called when another overlay is dragged onto this overlay
+        // This is how we capture overlays without reflection
+        plugin.onOverlayDragged(other);
+        return false; // Don't consume the event, let normal drag behavior continue
     }
 
     @Override

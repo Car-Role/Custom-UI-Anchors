@@ -14,8 +14,8 @@ import java.awt.Dimension;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
-import java.lang.reflect.Field;
 import java.lang.reflect.Type;
+import java.util.Iterator;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -117,15 +117,12 @@ public class AnchorCustomizerPlugin extends Plugin {
         clientToolbar.addNavigation(navButton);
 
         overlayManager.add(customizerOverlay);
-        // Note: AnchorInputListener constructor needs specific args, assuming updated
-        // version
-        // inputListener is already injected by Guice in most RuneLite setups if
-        // correctly bound
-        // but if manual creation is needed:
-        // inputListener = new AnchorInputListener(client, this);
         mouseManager.registerMouseListener(inputListener);
         loadRegions();
         loadOverlayAssignments();
+        
+        // Try to re-acquire overlay references for persisted assignments
+        scanAndReacquireOverlays();
 
         // Update panel
         SwingUtilities.invokeLater(() -> panel.updateList(anchorRegions));
@@ -312,8 +309,10 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
     }
 
-    // Map<OverlayClassName, RegionId> to track which region owns an overlay
+    // Map<OverlayClassName, RegionId> to track which region owns an overlay (persisted)
     private final Map<String, Integer> overlayAssignments = new HashMap<>();
+    // Map<OverlayClassName, Overlay> to store direct references to captured overlays (runtime only)
+    private final Map<String, Overlay> trackedOverlays = new HashMap<>();
 
     private void snapAndStackOverlays(boolean isResizingWindowIgnored) {
         if (anchorRegions.isEmpty())
@@ -332,21 +331,21 @@ public class AnchorCustomizerPlugin extends Plugin {
         boolean allowAssignmentChanges = isAltDown && !isResizingWindow && !isDraggingAnchor;
         boolean lockAssignments = !allowAssignmentChanges;
 
+        // Clean up any tracked overlays that no longer exist
+        cleanupTrackedOverlays();
+
         Map<Integer, List<Overlay>> buckets = new HashMap<>();
         for (AnchorRegion r : anchorRegions) {
             buckets.put(r.getId(), new ArrayList<>());
         }
 
-        List<Overlay> allOverlays = getOverlays();
-        if (allOverlays == null)
-            return;
+        // Process tracked overlays
+        for (Map.Entry<String, Overlay> entry : trackedOverlays.entrySet()) {
+            String overlayId = entry.getKey();
+            Overlay overlay = entry.getValue();
 
-        for (Overlay overlay : allOverlays) {
             if (overlay.getPreferredLocation() == null || !overlay.isMovable())
                 continue;
-
-            // Identify overlay by Class Name to ensure persistence across restarts
-            String overlayId = overlay.getClass().getName();
 
             Rectangle overlayBounds = overlay.getBounds();
             if (overlayBounds.isEmpty()) {
@@ -362,32 +361,30 @@ public class AnchorCustomizerPlugin extends Plugin {
             Integer assignedRegionId = overlayAssignments.get(overlayId);
 
             if (!lockAssignments) {
-                // "Capture" phase
+                // "Capture" phase - check if overlay moved into a different region or out of all regions
                 boolean foundInRegion = false;
                 for (AnchorRegion region : anchorRegions) {
                     if (region.getBounds().contains(center)) {
                         if (assignedRegionId == null || !assignedRegionId.equals(region.getId())) {
                             overlayAssignments.put(overlayId, region.getId());
-                            saveOverlayAssignments(); // Persist immediately on capture
+                            saveOverlayAssignments();
                         }
                         buckets.get(region.getId()).add(overlay);
                         foundInRegion = true;
                         break;
                     }
                 }
-                // If moved out of all regions, unassign
+                // If moved out of all regions, unassign and stop tracking
                 if (!foundInRegion) {
                     if (overlayAssignments.containsKey(overlayId)) {
                         overlayAssignments.remove(overlayId);
-                        saveOverlayAssignments(); // Persist immediately on release
+                        saveOverlayAssignments();
                     }
                 }
             } else {
-                // "Maintenance" phase
-                if (assignedRegionId != null) {
-                    if (buckets.containsKey(assignedRegionId)) {
-                        buckets.get(assignedRegionId).add(overlay);
-                    }
+                // "Maintenance" phase - just add to bucket if assigned
+                if (assignedRegionId != null && buckets.containsKey(assignedRegionId)) {
+                    buckets.get(assignedRegionId).add(overlay);
                 }
             }
         }
@@ -580,15 +577,100 @@ public class AnchorCustomizerPlugin extends Plugin {
         config.setOverlayAssignmentsJson(json);
     }
 
-    private List<Overlay> getOverlays() {
-        try {
-            Field field = OverlayManager.class.getDeclaredField("overlays");
-            field.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            List<Overlay> overlays = (List<Overlay>) field.get(overlayManager);
-            return overlays;
-        } catch (Exception e) {
-            return null;
+    /**
+     * Called when an overlay is dragged. Checks if it should be captured by an anchor region.
+     * This is the entry point for tracking overlays without reflection.
+     */
+    public void onOverlayDragged(Overlay overlay) {
+        if (overlay == null || !overlay.isMovable() || overlay == customizerOverlay)
+            return;
+
+        String overlayId = overlay.getClass().getName();
+
+        // Always track the overlay so we can manage it
+        if (!trackedOverlays.containsKey(overlayId)) {
+            trackedOverlays.put(overlayId, overlay);
+        }
+
+        // Check if it's inside any anchor region
+        Rectangle overlayBounds = overlay.getBounds();
+        if (overlayBounds.isEmpty()) {
+            Point loc = overlay.getPreferredLocation();
+            if (loc == null) return;
+            Dimension size = overlay.getPreferredSize();
+            if (size == null) size = new Dimension(100, 20);
+            overlayBounds = new Rectangle(loc.x, loc.y, size.width, size.height);
+        }
+
+        Point center = new Point((int) overlayBounds.getCenterX(), (int) overlayBounds.getCenterY());
+
+        boolean foundInRegion = false;
+        for (AnchorRegion region : anchorRegions) {
+            if (region.getBounds().contains(center)) {
+                Integer currentAssignment = overlayAssignments.get(overlayId);
+                if (currentAssignment == null || !currentAssignment.equals(region.getId())) {
+                    overlayAssignments.put(overlayId, region.getId());
+                    saveOverlayAssignments();
+                    log.debug("Captured overlay {} into region {}", overlayId, region.getName());
+                }
+                foundInRegion = true;
+                break;
+            }
+        }
+
+        if (!foundInRegion && overlayAssignments.containsKey(overlayId)) {
+            overlayAssignments.remove(overlayId);
+            saveOverlayAssignments();
+            log.debug("Released overlay {} from all regions", overlayId);
+        }
+    }
+
+    /**
+     * Scan all overlays using anyMatch and re-acquire references for previously assigned overlays.
+     * This is called on startup to restore overlay tracking from persisted assignments.
+     */
+    private void scanAndReacquireOverlays() {
+        if (overlayAssignments.isEmpty()) {
+            return;
+        }
+
+        // Use anyMatch to scan through overlays and capture references
+        // The predicate has a side-effect of storing references, but always returns false
+        // so we scan ALL overlays
+        overlayManager.anyMatch(overlay -> {
+            if (overlay == null || !overlay.isMovable() || overlay == customizerOverlay) {
+                return false;
+            }
+
+            String overlayId = overlay.getClass().getName();
+
+            // If this overlay was previously assigned, start tracking it again
+            if (overlayAssignments.containsKey(overlayId) && !trackedOverlays.containsKey(overlayId)) {
+                trackedOverlays.put(overlayId, overlay);
+                log.debug("Re-acquired overlay {} for region {}", overlayId, overlayAssignments.get(overlayId));
+            }
+
+            return false; // Always return false to continue scanning all overlays
+        });
+
+        log.debug("Re-acquired {} overlay references out of {} assignments", 
+                  trackedOverlays.size(), overlayAssignments.size());
+    }
+
+    /**
+     * Clean up tracked overlays that no longer exist in the overlay manager.
+     */
+    private void cleanupTrackedOverlays() {
+        Iterator<Map.Entry<String, Overlay>> it = trackedOverlays.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Overlay> entry = it.next();
+            Overlay overlay = entry.getValue();
+            // Check if overlay still exists using anyMatch (public API)
+            boolean exists = overlayManager.anyMatch(o -> o == overlay);
+            if (!exists) {
+                it.remove();
+                log.debug("Removed stale overlay reference: {}", entry.getKey());
+            }
         }
     }
 
