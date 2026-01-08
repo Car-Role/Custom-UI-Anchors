@@ -1,6 +1,11 @@
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/car_role)
 # Custom UI Anchors
 
-A RuneLite plugin that allows you to customize overlay anchor positions with configurable X/Y offsets.
+A RuneLite plugin that allows you to customize overlay anchor positions with configurable X/Y offsets so you can get a consistent UI when you resize RuneLite.
+
+
+https://github.com/user-attachments/assets/714d35a6-1b93-4244-bbfa-0a0fa91ce468
+
 
 ## Features
 
