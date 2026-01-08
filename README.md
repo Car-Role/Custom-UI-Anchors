@@ -40,20 +40,6 @@ The plugin adds offset controls for each anchor point:
 ### From Plugin Hub (Recommended)
 Search for "Custom UI Anchors" in the RuneLite Plugin Hub.
 
-### Manual Installation
-1. Clone this repository
-2. Run `./gradlew build`
-3. Copy the resulting JAR to your RuneLite plugins folder
-
-## Development
-
-```bash
-# Build the and package the plugin
-./gradlew shadowJar
-
-# Run RuneLite with the plugin loaded (Developer mode)
-./gradlew run
-```
 
 ## License
 
