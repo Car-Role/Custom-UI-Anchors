@@ -35,6 +35,7 @@ import javax.swing.SwingUtilities;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.KeyCode;
 import net.runelite.client.callback.ClientThread;
@@ -92,6 +93,23 @@ public class AnchorCustomizerPlugin extends Plugin {
     private final List<AnchorRegion> anchorRegions = new ArrayList<>();
     private Dimension lastViewport = null;
 
+    // The RuneLite canvas frequently resizes once during the first few hundred ms of
+    // plugin life, and again whenever the user transitions between login-screen (fixed
+    // canvas) and gameplay (user's resizable window). Treating either transition as a
+    // "user window resize" would shift every constraint-anchored region by hundreds of
+    // pixels and then persist the corrupted positions via saveRegions().
+    //
+    // We defend in depth with three independent checks in onClientTick before applying
+    // a viewport delta; if any one fails we silently reseed lastViewport instead:
+    //   1. Startup grace window (catches the very first settle on fast machines).
+    //   2. GameState gate: only track deltas while in LOGGED_IN (catches login-screen
+    //      dwell on slow machines, where grace expires long before the user clicks Play).
+    //   3. Plausibility clamp: skip any single delta whose magnitude exceeds half the
+    //      current canvas dimension (catches anything the other two miss, e.g. an
+    //      unexpected mid-session fullscreen/monitor swap we'd rather not auto-shift for).
+    private static final long VIEWPORT_GRACE_MS = 1500L;
+    private long startupTimeMs = 0L;
+
     // Debounced persistence + self-triggered config-reload suppression
     private static final long SAVE_DEBOUNCE_MS = 500L;
     private boolean regionsDirty = false;
@@ -142,6 +160,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         lastWrittenRegionJson = null;
         lastWrittenAssignmentsJson = null;
         lastViewport = null;
+        startupTimeMs = System.currentTimeMillis();
         lastResizeTime = 0L;
         lastReacquireTime = 0L;
         lastFusedWalkTime = 0L;
@@ -494,12 +513,29 @@ public class AnchorCustomizerPlugin extends Plugin {
         Rectangle currentViewport = getViewportBounds();
         if (currentViewport != null) {
             Dimension currentDim = currentViewport.getSize();
-            // initialize lastViewport if null
             if (lastViewport == null) {
+                // First observation ever; just seed.
                 lastViewport = currentDim;
             } else if (!lastViewport.equals(currentDim)) {
-                isResizingWindow = updateRegionPositions(lastViewport, currentDim);
-                lastViewport = currentDim;
+                // Three defense layers against false-positive "resizes" that would corrupt
+                // saved anchor positions. See field-level comment on VIEWPORT_GRACE_MS.
+                boolean inStartupGrace =
+                        (System.currentTimeMillis() - startupTimeMs) < VIEWPORT_GRACE_MS;
+                boolean loggedIn = client.getGameState() == GameState.LOGGED_IN;
+                int deltaW = Math.abs(currentDim.width - lastViewport.width);
+                int deltaH = Math.abs(currentDim.height - lastViewport.height);
+                // Guard against division by zero / degenerate dims during client init.
+                int halfW = Math.max(1, currentDim.width / 2);
+                int halfH = Math.max(1, currentDim.height / 2);
+                boolean plausibleDelta = deltaW <= halfW && deltaH <= halfH;
+
+                if (inStartupGrace || !loggedIn || !plausibleDelta) {
+                    // Silently track the new dimension; do NOT shift or persist regions.
+                    lastViewport = currentDim;
+                } else {
+                    isResizingWindow = updateRegionPositions(lastViewport, currentDim);
+                    lastViewport = currentDim;
+                }
             }
         }
 

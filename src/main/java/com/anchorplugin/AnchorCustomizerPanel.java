@@ -40,8 +40,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final JSpinner ySpinner;
     private final JSpinner widthSpinner;
     private final JSpinner heightSpinner;
-    private final JComboBox<AnchorConstraint> constraintComboBox;
-    private final JComboBox<AnchorAlignment> alignmentComboBox;
+    private final ArrowGridPicker<AnchorConstraint> constraintPicker;
+    private final ArrowGridPicker<AnchorAlignment> alignmentPicker;
     private final JComboBox<AnchorStacking> stackingComboBox;
 
     private AnchorRegion selectedRegion;
@@ -86,6 +86,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
         listContainer.add(scrollPane, BorderLayout.CENTER);
 
         JButton addButton = new JButton("Add New Region Anchor");
+        addButton.setToolTipText("Create a new anchor box. Hold Alt in-game to see and drag anchors, or drag overlays into a box to assign them.");
         addButton.addActionListener(e -> {
             plugin.createNewAnchor();
             // Plugin will trigger updateList()
@@ -113,9 +114,12 @@ public class AnchorCustomizerPanel extends PluginPanel {
         c.gridy = 0;
 
         // Name
-        propertiesPanel.add(new JLabel("Name:"), c);
+        JLabel nameLabel = new JLabel("Name:");
+        nameLabel.setToolTipText("Display name for this anchor (only shown in this sidebar).");
+        propertiesPanel.add(nameLabel, c);
         c.gridy++;
         nameField = new JTextField();
+        nameField.setToolTipText("Display name for this anchor (only shown in this sidebar).");
         nameField.addActionListener(e -> saveChanges());
         nameField.addFocusListener(new java.awt.event.FocusAdapter() {
             public void focusLost(java.awt.event.FocusEvent evt) {
@@ -124,30 +128,77 @@ public class AnchorCustomizerPanel extends PluginPanel {
         });
         propertiesPanel.add(nameField, c);
 
-        // Constraints
+        // Constraint picker (3x3 grid)
         c.gridy++;
-        propertiesPanel.add(new JLabel("Constraint:"), c);
+        JLabel constraintLabel = new JLabel("Constraint:");
+        constraintLabel.setToolTipText(
+                "Which part of the game window this anchor pins to. When the window is resized, "
+                        + "the anchor stays glued to the chosen corner / edge / center.");
+        propertiesPanel.add(constraintLabel, c);
         c.gridy++;
-        constraintComboBox = new JComboBox<>(AnchorConstraint.values());
-        constraintComboBox.setToolTipText("Which corner of the game window this box attaches to");
-        constraintComboBox.addActionListener(e -> saveChanges());
-        propertiesPanel.add(constraintComboBox, c);
+        AnchorConstraint[] constraintGrid = {
+                AnchorConstraint.TOP_LEFT, AnchorConstraint.TOP_CENTER, AnchorConstraint.TOP_RIGHT,
+                AnchorConstraint.CENTER_LEFT, AnchorConstraint.CENTER, AnchorConstraint.CENTER_RIGHT,
+                AnchorConstraint.BOTTOM_LEFT, AnchorConstraint.BOTTOM_CENTER, AnchorConstraint.BOTTOM_RIGHT,
+        };
+        String[] constraintCellTips = {
+                "Pin to the top-left corner of the game window.",
+                "Pin to the top edge, horizontally centered.",
+                "Pin to the top-right corner of the game window.",
+                "Pin to the left edge, vertically centered.",
+                "Pin to the center of the game window.",
+                "Pin to the right edge, vertically centered.",
+                "Pin to the bottom-left corner of the game window.",
+                "Pin to the bottom edge, horizontally centered.",
+                "Pin to the bottom-right corner of the game window.",
+        };
+        constraintPicker = new ArrowGridPicker<>(constraintGrid, constraintCellTips);
+        constraintPicker.setToolTipText(constraintLabel.getToolTipText());
+        constraintPicker.setOnChange(v -> saveChanges());
+        propertiesPanel.add(constraintPicker, c);
 
-        // Alignment
+        // Alignment picker (3x3 grid)
         c.gridy++;
-        propertiesPanel.add(new JLabel("Alignment:"), c);
+        JLabel alignLabel = new JLabel("Alignment:");
+        alignLabel.setToolTipText("Where overlays are placed inside this anchor box.");
+        propertiesPanel.add(alignLabel, c);
         c.gridy++;
-        alignmentComboBox = new JComboBox<>(AnchorAlignment.values());
-        alignmentComboBox.setToolTipText("Position of overlays inside this box");
-        alignmentComboBox.addActionListener(e -> saveChanges());
-        propertiesPanel.add(alignmentComboBox, c);
+        AnchorAlignment[] alignGrid = {
+                AnchorAlignment.TOP_LEFT, AnchorAlignment.TOP_CENTER, AnchorAlignment.TOP_RIGHT,
+                AnchorAlignment.CENTER_LEFT, AnchorAlignment.CENTER, AnchorAlignment.CENTER_RIGHT,
+                AnchorAlignment.BOTTOM_LEFT, AnchorAlignment.BOTTOM_CENTER, AnchorAlignment.BOTTOM_RIGHT,
+        };
+        String[] alignCellTips = {
+                "Align overlays to the top-left of this box.",
+                "Align overlays to the top, horizontally centered.",
+                "Align overlays to the top-right of this box.",
+                "Align overlays to the left, vertically centered.",
+                "Align overlays to the center of this box.",
+                "Align overlays to the right, vertically centered.",
+                "Align overlays to the bottom-left of this box.",
+                "Align overlays to the bottom, horizontally centered.",
+                "Align overlays to the bottom-right of this box.",
+        };
+        alignmentPicker = new ArrowGridPicker<>(alignGrid, alignCellTips);
+        alignmentPicker.setToolTipText(alignLabel.getToolTipText());
+        alignmentPicker.setOnChange(v -> {
+            if (isUpdating) return;
+            saveChanges();
+        });
+        propertiesPanel.add(alignmentPicker, c);
 
         // Stacking
         c.gridy++;
-        propertiesPanel.add(new JLabel("Stacking:"), c);
+        JLabel stackingLabel = new JLabel("Stacking:");
+        stackingLabel.setToolTipText(
+                "How multiple overlays inside this anchor are arranged. "
+                        + "Vertical = stacked top-to-bottom. Horizontal = left-to-right. "
+                        + "Fill-Horizontal = rows that wrap when the box fills up. "
+                        + "Fill-Vertical = columns that wrap when the box fills up.");
+        propertiesPanel.add(stackingLabel, c);
         c.gridy++;
         stackingComboBox = new JComboBox<>(AnchorStacking.values());
-        stackingComboBox.setToolTipText("How multiple overlays are arranged (e.g. Vertical/Horizontal/Flow)");
+        stackingComboBox.setToolTipText(stackingLabel.getToolTipText());
         stackingComboBox.addActionListener(e -> saveChanges());
         propertiesPanel.add(stackingComboBox, c);
 
@@ -155,13 +206,18 @@ public class AnchorCustomizerPanel extends PluginPanel {
         c.gridy++;
         JPanel posPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         posPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        String posTooltip = "Offset from the constraint corner, in pixels. Positive X goes right, positive Y goes down.";
         xSpinner = createSpinner("X");
-        xSpinner.setToolTipText("Horizontal offset from constraint anchor");
+        xSpinner.setToolTipText(posTooltip);
         ySpinner = createSpinner("Y");
-        ySpinner.setToolTipText("Vertical offset from constraint anchor");
-        posPanel.add(new JLabel("X: "));
+        ySpinner.setToolTipText(posTooltip);
+        JLabel xLabel = new JLabel("X: ");
+        xLabel.setToolTipText(posTooltip);
+        JLabel yLabel = new JLabel("  Y: ");
+        yLabel.setToolTipText(posTooltip);
+        posPanel.add(xLabel);
         posPanel.add(xSpinner);
-        posPanel.add(new JLabel("  Y: "));
+        posPanel.add(yLabel);
         posPanel.add(ySpinner);
         propertiesPanel.add(posPanel, c);
 
@@ -169,19 +225,25 @@ public class AnchorCustomizerPanel extends PluginPanel {
         c.gridy++;
         JPanel sizePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         sizePanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        String sizeTooltip = "Width and height of the anchor box, in pixels.";
         widthSpinner = createSpinner("W");
-        widthSpinner.setToolTipText("Width of the region");
+        widthSpinner.setToolTipText(sizeTooltip);
         heightSpinner = createSpinner("H");
-        heightSpinner.setToolTipText("Height of the region");
-        sizePanel.add(new JLabel("W: "));
+        heightSpinner.setToolTipText(sizeTooltip);
+        JLabel wLabel = new JLabel("W: ");
+        wLabel.setToolTipText(sizeTooltip);
+        JLabel hLabel = new JLabel("  H: ");
+        hLabel.setToolTipText(sizeTooltip);
+        sizePanel.add(wLabel);
         sizePanel.add(widthSpinner);
-        sizePanel.add(new JLabel("  H: "));
+        sizePanel.add(hLabel);
         sizePanel.add(heightSpinner);
         propertiesPanel.add(sizePanel, c);
 
         // Delete Button
         c.gridy++;
         JButton deleteButton = new JButton("Delete Region Anchor");
+        deleteButton.setToolTipText("Permanently delete this anchor. Overlays assigned to it will be released back to free-floating.");
         deleteButton.setBackground(Color.RED.darker());
         deleteButton.setForeground(Color.WHITE);
         deleteButton.addActionListener(e -> deleteSelectedRegion());
@@ -261,9 +323,18 @@ public class AnchorCustomizerPanel extends PluginPanel {
         ySpinner.setValue(selectedRegion.getY());
         widthSpinner.setValue(selectedRegion.getWidth());
         heightSpinner.setValue(selectedRegion.getHeight());
-        constraintComboBox.setSelectedItem(selectedRegion.getConstraint());
-        alignmentComboBox.setSelectedItem(
-                selectedRegion.getAlignment() != null ? selectedRegion.getAlignment() : AnchorAlignment.CENTER);
+        constraintPicker.setSelectedValue(
+                selectedRegion.getConstraint() != null ? selectedRegion.getConstraint() : AnchorConstraint.TOP_LEFT);
+
+        AnchorAlignment currentAlign = selectedRegion.getAlignment() != null
+                ? selectedRegion.getAlignment() : AnchorAlignment.CENTER;
+        // Legacy STRETCH values from older configs are displayed (and saved) as CENTER
+        // now that the Stretch toggle has been removed from the UI.
+        if (currentAlign == AnchorAlignment.STRETCH) {
+            currentAlign = AnchorAlignment.CENTER;
+        }
+        alignmentPicker.setSelectedValue(currentAlign);
+
         stackingComboBox.setSelectedItem(
                 selectedRegion.getStacking() != null ? selectedRegion.getStacking() : AnchorStacking.VERTICAL);
         isUpdating = false;
@@ -284,8 +355,12 @@ public class AnchorCustomizerPanel extends PluginPanel {
         final int newY = (Integer) ySpinner.getValue();
         final int newW = (Integer) widthSpinner.getValue();
         final int newH = (Integer) heightSpinner.getValue();
-        final AnchorConstraint newConstraint = (AnchorConstraint) constraintComboBox.getSelectedItem();
-        final AnchorAlignment newAlignment = (AnchorAlignment) alignmentComboBox.getSelectedItem();
+        AnchorConstraint newConstraint = constraintPicker.getSelectedValue();
+        if (newConstraint == null) newConstraint = AnchorConstraint.TOP_LEFT;
+        final AnchorConstraint finalConstraint = newConstraint;
+
+        AnchorAlignment picked = alignmentPicker.getSelectedValue();
+        final AnchorAlignment newAlignment = picked != null ? picked : AnchorAlignment.CENTER;
         final AnchorStacking newStacking = (AnchorStacking) stackingComboBox.getSelectedItem();
 
         plugin.updateRegion(selectedRegion, r -> {
@@ -294,7 +369,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setY(newY);
             r.setWidth(newW);
             r.setHeight(newH);
-            r.setConstraint(newConstraint);
+            r.setConstraint(finalConstraint);
             r.setAlignment(newAlignment);
             r.setStacking(newStacking);
         });

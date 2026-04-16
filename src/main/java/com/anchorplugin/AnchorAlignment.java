@@ -14,9 +14,11 @@ public enum AnchorAlignment {
     BOTTOM_LEFT,
     BOTTOM_CENTER,
     BOTTOM_RIGHT,
-    STRETCH // Adding STRETCH as a potential 10th option for "fill" behavior if needed, or
-            // just to round it out.
-    // Actually user said "ten options". Let's Stick to standard 9 for now to match
-    // constraints,
-    // maybe "STRETCH" is the 10th. I'll add it just in case.
+    /**
+     * @deprecated The Stretch toggle was removed from the UI because it was unreliable.
+     * This value is retained only so older saved configs (persisted via Gson) continue
+     * to deserialize; the panel coerces it to {@link #CENTER} on load.
+     */
+    @Deprecated
+    STRETCH
 }

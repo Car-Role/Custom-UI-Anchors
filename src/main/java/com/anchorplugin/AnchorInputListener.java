@@ -8,6 +8,8 @@ import java.awt.Cursor;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.event.MouseEvent;
+import java.util.ArrayList;
+import java.util.List;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
@@ -55,23 +57,25 @@ public class AnchorInputListener implements MouseListener {
         }
 
         Point mousePos = e.getPoint();
-
-        for (AnchorRegion region : plugin.getAnchorRegions()) {
-            Rectangle bounds = region.getBounds();
-            if (bounds.contains(mousePos) || isNearResizeHandle(bounds, mousePos)) {
-                isDragging = true;
-                draggedAnchor = region;
-                dragStartPoint = mousePos;
-                originalBounds = new Rectangle(bounds);
-
-                resizeDirection = getResizeDirection(bounds, mousePos);
-                isResizing = resizeDirection != 0;
-
-                e.consume();
-                return e;
-            }
+        AnchorRegion region = pickAnchorByClickCount(mousePos, e.getClickCount());
+        if (region == null) {
+            return e;
         }
 
+        Rectangle bounds = region.getBounds();
+        isDragging = true;
+        draggedAnchor = region;
+        dragStartPoint = mousePos;
+        originalBounds = new Rectangle(bounds);
+
+        resizeDirection = getResizeDirection(bounds, mousePos);
+        isResizing = resizeDirection != 0;
+
+        // Reflect the picked anchor in the panel so double-click-drag visibly picks the
+        // one beneath, not just silently drag it.
+        plugin.selectAnchor(region);
+
+        e.consume();
         return e;
     }
 
@@ -126,32 +130,59 @@ public class AnchorInputListener implements MouseListener {
         if (!plugin.isOverlaysVisible())
             return e;
 
-        // Allow selection if visible.
-        // If Alt is NOT held, we just select but do NOT consume (allow click-through)
-        // If Alt IS held, we consume (edit mode)
-
+        // Click-through for overlapping anchors:
+        //   click count 1 → topmost
+        //   click count 2 → the one beneath
+        //   click count 3 → beneath that, … wraps around after the bottom.
+        // Consume events only when Alt is held (explicit edit mode); a non-Alt click
+        // still selects in the panel but is allowed to pass through to the game.
         Point mousePos = e.getPoint();
-        boolean found = false;
-
-        for (AnchorRegion region : plugin.getAnchorRegions()) {
-            if (region.getBounds().contains(mousePos)) {
-                plugin.selectAnchor(region);
-                found = true;
-                break;
-            }
-        }
-
-        if (found) {
+        AnchorRegion picked = pickAnchorByClickCount(mousePos, e.getClickCount());
+        if (picked != null) {
+            plugin.selectAnchor(picked);
             if (client.isKeyPressed(KeyCode.KC_ALT)) {
                 e.consume();
             }
         } else if (client.isKeyPressed(KeyCode.KC_ALT)) {
-            // Only deselect if Alt is held (explicit edit intention), otherwise clicking
-            // void shouldn't drop selection
+            // Only deselect if Alt is held (explicit edit intention); clicking into
+            // empty space without Alt should not drop the panel selection.
             plugin.selectAnchor(null);
         }
 
         return e;
+    }
+
+    /**
+     * Collect every anchor region whose bounds (or resize handle zone) contain {@code p},
+     * ordered from topmost to bottommost. "Topmost" matches {@link AnchorCustomizerOverlay}'s
+     * drawing order: the last element in {@code plugin.getAnchorRegions()} is drawn last
+     * and therefore appears on top, so we iterate the list in reverse.
+     */
+    private List<AnchorRegion> pickAnchorsAt(Point p) {
+        List<AnchorRegion> regions = plugin.getAnchorRegions();
+        List<AnchorRegion> hits = new ArrayList<>();
+        for (int i = regions.size() - 1; i >= 0; i--) {
+            AnchorRegion r = regions.get(i);
+            Rectangle b = r.getBounds();
+            if (b.contains(p) || isNearResizeHandle(b, p)) {
+                hits.add(r);
+            }
+        }
+        return hits;
+    }
+
+    /**
+     * Pick the nth anchor at {@code p}, where n is derived from {@code clickCount}
+     * (single-click = topmost, double-click = one beneath, etc.). Wraps around the
+     * bottom so repeated clicks cycle through the overlap stack instead of getting
+     * stuck.
+     */
+    private AnchorRegion pickAnchorByClickCount(Point p, int clickCount) {
+        List<AnchorRegion> hits = pickAnchorsAt(p);
+        if (hits.isEmpty()) return null;
+        int safeCount = Math.max(1, clickCount);
+        int idx = (safeCount - 1) % hits.size();
+        return hits.get(idx);
     }
 
     @Override
