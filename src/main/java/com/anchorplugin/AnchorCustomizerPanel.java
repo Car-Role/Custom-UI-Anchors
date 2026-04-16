@@ -218,6 +218,17 @@ public class AnchorCustomizerPanel extends PluginPanel {
         refreshPropertiesUI();
     }
 
+    /**
+     * Refresh property spinners/combos for the currently selected region without
+     * touching JList selection. Safe to call frequently (e.g., during anchor drag).
+     */
+    public void refreshSelectedRegionProperties(AnchorRegion region) {
+        if (region == null || selectedRegion == null || region.getId() != selectedRegion.getId()) {
+            return;
+        }
+        refreshPropertiesUI();
+    }
+
     public void setSelectedRegion(AnchorRegion region) {
         if (isUpdating)
             return;
@@ -262,16 +273,27 @@ public class AnchorCustomizerPanel extends PluginPanel {
         if (selectedRegion == null || isUpdating)
             return;
 
-        selectedRegion.setName(nameField.getText());
-        selectedRegion.setX((Integer) xSpinner.getValue());
-        selectedRegion.setY((Integer) ySpinner.getValue());
-        selectedRegion.setWidth((Integer) widthSpinner.getValue());
-        selectedRegion.setHeight((Integer) heightSpinner.getValue());
-        selectedRegion.setConstraint((AnchorConstraint) constraintComboBox.getSelectedItem());
-        selectedRegion.setAlignment((AnchorAlignment) alignmentComboBox.getSelectedItem());
-        selectedRegion.setStacking((AnchorStacking) stackingComboBox.getSelectedItem());
+        // Snapshot values off the EDT fields before handing the mutation to the client
+        // thread, so Swing can't update the spinners mid-apply.
+        final String newName = nameField.getText();
+        final int newX = (Integer) xSpinner.getValue();
+        final int newY = (Integer) ySpinner.getValue();
+        final int newW = (Integer) widthSpinner.getValue();
+        final int newH = (Integer) heightSpinner.getValue();
+        final AnchorConstraint newConstraint = (AnchorConstraint) constraintComboBox.getSelectedItem();
+        final AnchorAlignment newAlignment = (AnchorAlignment) alignmentComboBox.getSelectedItem();
+        final AnchorStacking newStacking = (AnchorStacking) stackingComboBox.getSelectedItem();
 
-        plugin.saveRegions(); // Persist and redraw
+        plugin.updateRegion(selectedRegion, r -> {
+            r.setName(newName);
+            r.setX(newX);
+            r.setY(newY);
+            r.setWidth(newW);
+            r.setHeight(newH);
+            r.setConstraint(newConstraint);
+            r.setAlignment(newAlignment);
+            r.setStacking(newStacking);
+        });
         regionList.repaint(); // Repaint list for name changes
     }
 

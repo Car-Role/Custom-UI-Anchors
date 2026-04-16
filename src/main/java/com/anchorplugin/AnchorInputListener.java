@@ -93,11 +93,12 @@ public class AnchorInputListener implements MouseListener {
             handleMove(dx, dy);
         }
 
-        // Force immediate overlay repositioning so UI follows anchor without lag
-        plugin.forceRepositionOverlays();
+        // Ask the next client tick to snap overlays; avoids a synchronous cross-thread
+        // snap pass on every mouse-move event.
+        plugin.requestSnap();
 
-        // Live update for panel properties
-        plugin.selectAnchor(draggedAnchor);
+        // Live update for panel properties (lightweight; no JList mutation)
+        plugin.refreshSelectedAnchorProperties(draggedAnchor);
 
         e.consume();
         return e;

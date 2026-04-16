@@ -15,13 +15,16 @@ import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.lang.reflect.Type;
-import java.util.Iterator;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
@@ -29,6 +32,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.KeyCode;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
@@ -71,6 +75,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     @Inject
     private ClientToolbar clientToolbar;
 
+    @Inject
+    private ClientThread clientThread;
+
     private AnchorCustomizerPanel panel;
     private NavigationButton navButton;
 
@@ -79,6 +86,29 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     private final List<AnchorRegion> anchorRegions = new ArrayList<>();
     private Dimension lastViewport = null;
+
+    // Debounced persistence + self-triggered config-reload suppression
+    private static final long SAVE_DEBOUNCE_MS = 500L;
+    private boolean regionsDirty = false;
+    private boolean assignmentsDirty = false;
+    private long lastFlushTime = 0L;
+    private String lastWrittenRegionJson = null;
+    private String lastWrittenAssignmentsJson = null;
+
+    // Periodic re-acquire throttle for overlays that load after startup
+    private long lastReacquireTime = 0L;
+    private static final long REACQUIRE_INTERVAL_MS = 1000L;
+
+    // Fused overlay walk (cleanup + auto-track) throttle. Runs when the mouse or any
+    // tracked overlay moves, or at least once per interval as a safety net so new
+    // overlays that register mid-session are still picked up.
+    private long lastFusedWalkTime = 0L;
+    private int lastMouseX = Integer.MIN_VALUE;
+    private int lastMouseY = Integer.MIN_VALUE;
+    private static final long FUSED_WALK_MIN_INTERVAL_MS = 500L;
+
+    // Flag set by input listeners asking the next client tick to run an immediate snap.
+    private volatile boolean needsSnap = false;
 
     public boolean isOverlaysVisible() {
         boolean isPanelOpen = panel != null && panel.isShowing();
@@ -90,8 +120,13 @@ public class AnchorCustomizerPlugin extends Plugin {
         return inputListener != null && inputListener.isDragging();
     }
 
-    public void forceRepositionOverlays() {
-        snapAndStackOverlays(false);
+    /**
+     * Ask the next {@code onClientTick} to run a snap pass. Safe to call from any
+     * thread; the actual snap runs on the client thread where {@code anchorRegions}
+     * is iterated.
+     */
+    public void requestSnap() {
+        needsSnap = true;
     }
 
     @Override
@@ -123,17 +158,25 @@ public class AnchorCustomizerPlugin extends Plugin {
         
         // Try to re-acquire overlay references for persisted assignments
         scanAndReacquireOverlays();
+        lastReacquireTime = System.currentTimeMillis();
 
         // Update panel
-        SwingUtilities.invokeLater(() -> panel.updateList(anchorRegions));
+        final List<AnchorRegion> snapshot = new ArrayList<>(anchorRegions);
+        SwingUtilities.invokeLater(() -> panel.updateList(snapshot));
     }
 
     @Override
     protected void shutDown() throws Exception {
+        // Flush any pending persistence before tearing down
+        flushPendingSaves(true);
         overlayManager.remove(customizerOverlay);
         mouseManager.unregisterMouseListener(inputListener);
         clientToolbar.removeNavigation(navButton);
         anchorRegions.clear();
+        trackedOverlays.clear();
+        overlayAssignments.clear();
+        lastSeenLocations.clear();
+        lastExternalMoveTime.clear();
     }
 
     @Subscribe
@@ -143,12 +186,31 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         if (event.getKey().equals("regionJson")) {
-            loadRegions();
-            SwingUtilities.invokeLater(() -> panel.updateList(anchorRegions));
+            String incoming = event.getNewValue();
+            // Suppress self-triggered reloads when the value matches what we just wrote
+            if (incoming != null && incoming.equals(lastWrittenRegionJson)) {
+                return;
+            }
+            clientThread.invoke(() -> {
+                loadRegions();
+                final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
+                SwingUtilities.invokeLater(() -> panel.updateList(snap));
+            });
+        } else if (event.getKey().equals("overlayAssignments")) {
+            String incoming = event.getNewValue();
+            if (incoming != null && incoming.equals(lastWrittenAssignmentsJson)) {
+                return;
+            }
+            clientThread.invoke(this::loadOverlayAssignments);
         }
     }
 
     public void createNewAnchor() {
+        // Route mutation onto the client thread to match where anchorRegions is iterated
+        clientThread.invoke(this::createNewAnchorOnClientThread);
+    }
+
+    private void createNewAnchorOnClientThread() {
         int nextId = 1;
         List<Integer> ids = new ArrayList<>();
         for (AnchorRegion r : anchorRegions)
@@ -179,18 +241,42 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorStacking.VERTICAL);
 
         anchorRegions.add(region);
-        saveRegions();
+        markRegionsDirty();
         selectAnchor(region);
+        final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
+        SwingUtilities.invokeLater(() -> panel.updateList(snap));
     }
 
     public void deleteRegion(AnchorRegion region) {
-        anchorRegions.remove(region);
-        saveRegions();
-        selectAnchor(null);
+        clientThread.invoke(() -> {
+            anchorRegions.remove(region);
+            markRegionsDirty();
+            selectAnchor(null);
+            final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
+            SwingUtilities.invokeLater(() -> panel.updateList(snap));
+        });
     }
 
     public void selectAnchor(AnchorRegion region) {
         SwingUtilities.invokeLater(() -> panel.setSelectedRegion(region));
+    }
+
+    /** Lightweight panel-properties refresh (no JList mutation). */
+    public void refreshSelectedAnchorProperties(AnchorRegion region) {
+        SwingUtilities.invokeLater(() -> panel.refreshSelectedRegionProperties(region));
+    }
+
+    /**
+     * Apply a mutation to a region on the client thread (the same thread that iterates
+     * {@code anchorRegions} during the snap loop). Guarantees panel edits can't race with
+     * the render pipeline mid-update. Persists immediately after.
+     */
+    public void updateRegion(AnchorRegion region, java.util.function.Consumer<AnchorRegion> updater) {
+        if (region == null || updater == null) return;
+        clientThread.invoke(() -> {
+            updater.accept(region);
+            saveRegions();
+        });
     }
 
     private void loadRegions() {
@@ -205,16 +291,64 @@ public class AnchorCustomizerPlugin extends Plugin {
             }.getType();
             List<AnchorRegion> loaded = gson.fromJson(json, listType);
             if (loaded != null) {
-                anchorRegions.addAll(loaded);
+                for (AnchorRegion r : loaded) {
+                    if (r == null) continue;
+                    // Normalize null enums (may occur in old persisted data)
+                    if (r.getConstraint() == null) r.setConstraint(AnchorConstraint.TOP_LEFT);
+                    if (r.getAlignment() == null) r.setAlignment(AnchorAlignment.CENTER);
+                    if (r.getStacking() == null) r.setStacking(AnchorStacking.VERTICAL);
+                    anchorRegions.add(r);
+                }
             }
         } catch (Exception e) {
             log.error("Failed to load regions", e);
         }
     }
 
+    /**
+     * Persist regions immediately. Regions change infrequently (user actions: create,
+     * delete, rename, panel edits, window resize) so we never debounce them — this
+     * guarantees durability even if RuneLite is killed abruptly.
+     */
     public void saveRegions() {
         String json = gson.toJson(anchorRegions);
+        lastWrittenRegionJson = json;
         config.setRegionJson(json);
+        regionsDirty = false;
+    }
+
+    private void markRegionsDirty() {
+        // Kept for compatibility: treat as an immediate save. Regions are small and
+        // change infrequently; no reason to delay persistence.
+        saveRegions();
+    }
+
+    private void markAssignmentsDirty() {
+        assignmentsDirty = true;
+    }
+
+    /**
+     * Flush pending assignment writes. Assignments can churn during capture-phase
+     * drags (up to ~50 Hz), so they are debounced on the tick loop. Force-flush on
+     * shutDown to guarantee persistence.
+     */
+    private void flushPendingSaves(boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && (now - lastFlushTime) < SAVE_DEBOUNCE_MS) {
+            return;
+        }
+        if (regionsDirty) {
+            // Defensive: should normally be false because saveRegions writes immediately,
+            // but flush anything still marked dirty just in case.
+            saveRegions();
+        }
+        if (assignmentsDirty) {
+            String json = gson.toJson(overlayAssignments);
+            lastWrittenAssignmentsJson = json;
+            config.setOverlayAssignmentsJson(json);
+            assignmentsDirty = false;
+        }
+        lastFlushTime = now;
     }
 
     public List<AnchorRegion> getAnchorRegions() {
@@ -251,6 +385,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         snapAndStackOverlays(isResizingWindow);
+        flushPendingSaves(false);
     }
 
     private long lastResizeTime = 0;
@@ -261,10 +396,11 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         lastResizeTime = System.currentTimeMillis();
 
-        for (AnchorRegion region : anchorRegions) {
+        // Snapshot to avoid concurrent modification if panel edits fire during iteration
+        for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
             updateRegionConstraint(region, oldDim, newDim);
         }
-        saveRegions(); // Persist new positions
+        markRegionsDirty(); // Persist new positions (debounced)
         return true;
     }
 
@@ -309,14 +445,51 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
     }
 
-    // Map<OverlayClassName, RegionId> to track which region owns an overlay (persisted)
-    private final Map<String, Integer> overlayAssignments = new HashMap<>();
-    // Map<OverlayClassName, Overlay> to store direct references to captured overlays (runtime only)
-    private final Map<String, Overlay> trackedOverlays = new HashMap<>();
+    // Map<OverlayKey, RegionId> to track which region owns an overlay (persisted)
+    private final Map<String, Integer> overlayAssignments = new ConcurrentHashMap<>();
+    // Map<OverlayKey, Overlay> to store direct references to captured overlays (runtime only)
+    private final Map<String, Overlay> trackedOverlays = new ConcurrentHashMap<>();
+
+    /**
+     * Stable identity for an overlay. Prefers {@link Overlay#getName()} (which is
+     * overridden to something unique by RuneLite plugins that register multiple
+     * instances of the same class — e.g. screen markers, timers). Falls back to the
+     * class FQN when the name is blank. Both code paths use only public Overlay API —
+     * no reflection.
+     */
+    private static String overlayKey(Overlay overlay) {
+        if (overlay == null) return null;
+        String name = overlay.getName();
+        if (name != null && !name.isEmpty()) {
+            return name;
+        }
+        return overlay.getClass().getName();
+    }
+
+    // Drag-detection: track the preferredLocation we observed at the end of the previous
+    // tick. If it differs from the current preferredLocation, something moved the overlay
+    // between ticks (RuneLite drag renderer following the cursor). Used to avoid fighting
+    // the drag. `lastSeenLocations` is updated every tick AFTER apply-positions so that
+    // both our own setPreferredLocation and external moves are captured uniformly.
+    private final Map<String, Point> lastSeenLocations = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastExternalMoveTime = new ConcurrentHashMap<>();
+    private static final long DRAG_DETECT_MS = 125L;
 
     private void snapAndStackOverlays(boolean isResizingWindowIgnored) {
         if (anchorRegions.isEmpty())
             return;
+
+        // Snapshot regions once per call (defensive against EDT/panel edits)
+        final List<AnchorRegion> regionsSnapshot = new ArrayList<>(anchorRegions);
+
+        // Periodically re-acquire overlays that may have registered after startup
+        long nowMs = System.currentTimeMillis();
+        if (!overlayAssignments.isEmpty()
+                && overlayAssignments.size() > trackedOverlays.size()
+                && (nowMs - lastReacquireTime) >= REACQUIRE_INTERVAL_MS) {
+            scanAndReacquireOverlays();
+            lastReacquireTime = nowMs;
+        }
 
         boolean isAltDown = client.isKeyPressed(KeyCode.KC_ALT);
         // Lock assignments during:
@@ -331,11 +504,50 @@ public class AnchorCustomizerPlugin extends Plugin {
         boolean allowAssignmentChanges = isAltDown && !isResizingWindow && !isDraggingAnchor;
         boolean lockAssignments = !allowAssignmentChanges;
 
-        // Clean up any tracked overlays that no longer exist
-        cleanupTrackedOverlays();
+        // --- Drag detection pass (runs before fused walk so we know who is dragging) ---
+        // Compare current preferredLocation to the one observed at the end of the previous
+        // tick. If they differ, the overlay moved between ticks (cursor-driven drag). We
+        // keep the "dragging" flag for a short window after the last change so that a
+        // momentary pause (cursor not moving but button still held) doesn't flip to snap.
+        final Set<String> draggingIds = Collections.newSetFromMap(new HashMap<>());
+        boolean anyOverlayMoved = false;
+        for (Map.Entry<String, Overlay> entry : trackedOverlays.entrySet()) {
+            String id = entry.getKey();
+            Overlay ov = entry.getValue();
+            Point cur = ov.getPreferredLocation();
+            if (cur == null) continue;
+            Point last = lastSeenLocations.get(id);
+            if (last != null && !cur.equals(last)) {
+                lastExternalMoveTime.put(id, nowMs);
+                anyOverlayMoved = true;
+            }
+            Long t = lastExternalMoveTime.get(id);
+            if (t != null && (nowMs - t) < DRAG_DETECT_MS) {
+                draggingIds.add(id);
+            }
+        }
+
+        // Short-circuit: if neither the mouse nor any tracked overlay has moved since
+        // the last tick, skip the expensive fused walk. We still need to fall through
+        // to the apply-positions step — but the auto-track + staleness-check passes can
+        // wait for something to actually change.
+        net.runelite.api.Point mcp = client.getMouseCanvasPosition();
+        int mouseX = mcp != null ? mcp.getX() : Integer.MIN_VALUE;
+        int mouseY = mcp != null ? mcp.getY() : Integer.MIN_VALUE;
+        boolean mouseMoved = (mouseX != lastMouseX || mouseY != lastMouseY);
+        lastMouseX = mouseX;
+        lastMouseY = mouseY;
+
+        boolean runFusedWalk = mouseMoved || anyOverlayMoved
+                || (nowMs - lastFusedWalkTime) >= FUSED_WALK_MIN_INTERVAL_MS;
+
+        if (runFusedWalk) {
+            runFusedOverlayWalk(regionsSnapshot, lockAssignments);
+            lastFusedWalkTime = nowMs;
+        }
 
         Map<Integer, List<Overlay>> buckets = new HashMap<>();
-        for (AnchorRegion r : anchorRegions) {
+        for (AnchorRegion r : regionsSnapshot) {
             buckets.put(r.getId(), new ArrayList<>());
         }
 
@@ -359,30 +571,40 @@ public class AnchorCustomizerPlugin extends Plugin {
             Point center = new Point((int) overlayBounds.getCenterX(), (int) overlayBounds.getCenterY());
 
             Integer assignedRegionId = overlayAssignments.get(overlayId);
+            boolean isDraggingThis = draggingIds.contains(overlayId);
 
             if (!lockAssignments) {
                 // "Capture" phase - check if overlay moved into a different region or out of all regions
                 boolean foundInRegion = false;
-                for (AnchorRegion region : anchorRegions) {
+                for (AnchorRegion region : regionsSnapshot) {
                     if (region.getBounds().contains(center)) {
                         if (assignedRegionId == null || !assignedRegionId.equals(region.getId())) {
                             overlayAssignments.put(overlayId, region.getId());
-                            saveOverlayAssignments();
+                            markAssignmentsDirty();
                         }
                         buckets.get(region.getId()).add(overlay);
                         foundInRegion = true;
                         break;
                     }
                 }
-                // If moved out of all regions, unassign and stop tracking
-                if (!foundInRegion) {
+                // If moved out of all regions, unassign — but NEVER while the overlay is
+                // being dragged. Drag motion can briefly push the center outside a region
+                // between cursor samples; unassigning there would orphan the overlay on
+                // release. Keep its current assignment so it re-enters its bucket cleanly.
+                if (!foundInRegion && !isDraggingThis) {
                     if (overlayAssignments.containsKey(overlayId)) {
                         overlayAssignments.remove(overlayId);
-                        saveOverlayAssignments();
+                        markAssignmentsDirty();
                     }
+                } else if (!foundInRegion && isDraggingThis && assignedRegionId != null
+                        && buckets.containsKey(assignedRegionId)) {
+                    // Dragging outside all regions but still holding: keep it in its
+                    // current bucket visually so other overlays don't reshuffle twice.
+                    buckets.get(assignedRegionId).add(overlay);
                 }
             } else {
-                // "Maintenance" phase - just add to bucket if assigned
+                // "Maintenance" phase (or dragging in-region) - keep current assignment,
+                // just add to its bucket so it participates in sort/layout without bouncing regions.
                 if (assignedRegionId != null && buckets.containsKey(assignedRegionId)) {
                     buckets.get(assignedRegionId).add(overlay);
                 }
@@ -390,17 +612,27 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         // Process buckets (Positioning logic)
-        for (AnchorRegion region : anchorRegions) {
+        for (AnchorRegion region : regionsSnapshot) {
             List<Overlay> overlays = buckets.get(region.getId());
             if (overlays.isEmpty())
                 continue;
 
-            // Sort based on current Y to maintain stability
-            overlays.sort(Comparator.comparingInt(o -> o.getBounds().y));
-
             AnchorStacking stacking = region.getStacking();
             if (stacking == null)
                 stacking = AnchorStacking.VERTICAL;
+
+            // Sort along the stacking axis so that reordering (e.g. dragging one overlay
+            // past another) reflects the user's intent. Horizontal stacks sort by X,
+            // vertical and fill layouts sort by Y.
+            final AnchorStacking sortStacking = stacking;
+            overlays.sort((a, b) -> {
+                Rectangle ba = a.getBounds();
+                Rectangle bb = b.getBounds();
+                if (sortStacking == AnchorStacking.HORIZONTAL) {
+                    return Integer.compare(ba.x, bb.x);
+                }
+                return Integer.compare(ba.y, bb.y);
+            });
 
             // 1. Calculate Layout Dimensions & Individual Positions relative to (0,0)
             List<Rectangle> relativeBounds = new ArrayList<>();
@@ -547,10 +779,31 @@ public class AnchorCustomizerPlugin extends Plugin {
                     overlay.setPreferredPosition(OverlayPosition.DYNAMIC);
                 }
 
+                String overlayId = overlayKey(overlay);
+                if (overlayId == null) continue;
+                // If this overlay is being dragged by the user, don't fight the drag renderer.
+                // Let its cursor-driven position stand; other overlays will reflow around it.
+                if (draggingIds.contains(overlayId)) {
+                    continue;
+                }
+
+                Point targetPoint = new Point(targetX, targetY);
                 Point currentLoc = overlay.getPreferredLocation();
                 if (currentLoc == null || currentLoc.x != targetX || currentLoc.y != targetY) {
-                    overlay.setPreferredLocation(new Point(targetX, targetY));
+                    overlay.setPreferredLocation(targetPoint);
                 }
+            }
+        }
+
+        // End-of-tick: snapshot every tracked overlay's current preferredLocation so that
+        // the next tick's drag-detection pass can tell whether it changed between ticks.
+        // We include dragged overlays too — that way when the user releases (cursor stops
+        // moving), the next tick sees cur == lastSeen, drag detection falls off after
+        // DRAG_DETECT_MS, and the overlay snaps into its anchor slot.
+        for (Map.Entry<String, Overlay> entry : trackedOverlays.entrySet()) {
+            Point loc = entry.getValue().getPreferredLocation();
+            if (loc != null) {
+                lastSeenLocations.put(entry.getKey(), new Point(loc));
             }
         }
     }
@@ -573,8 +826,7 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     private void saveOverlayAssignments() {
-        String json = gson.toJson(overlayAssignments);
-        config.setOverlayAssignmentsJson(json);
+        markAssignmentsDirty();
     }
 
     /**
@@ -585,7 +837,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (overlay == null || !overlay.isMovable() || overlay == customizerOverlay)
             return;
 
-        String overlayId = overlay.getClass().getName();
+        String overlayId = overlayKey(overlay);
+        if (overlayId == null) return;
 
         // Always track the overlay so we can manage it
         if (!trackedOverlays.containsKey(overlayId)) {
@@ -605,12 +858,12 @@ public class AnchorCustomizerPlugin extends Plugin {
         Point center = new Point((int) overlayBounds.getCenterX(), (int) overlayBounds.getCenterY());
 
         boolean foundInRegion = false;
-        for (AnchorRegion region : anchorRegions) {
+        for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
             if (region.getBounds().contains(center)) {
                 Integer currentAssignment = overlayAssignments.get(overlayId);
                 if (currentAssignment == null || !currentAssignment.equals(region.getId())) {
                     overlayAssignments.put(overlayId, region.getId());
-                    saveOverlayAssignments();
+                    markAssignmentsDirty();
                     log.debug("Captured overlay {} into region {}", overlayId, region.getName());
                 }
                 foundInRegion = true;
@@ -620,7 +873,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         if (!foundInRegion && overlayAssignments.containsKey(overlayId)) {
             overlayAssignments.remove(overlayId);
-            saveOverlayAssignments();
+            markAssignmentsDirty();
             log.debug("Released overlay {} from all regions", overlayId);
         }
     }
@@ -642,7 +895,8 @@ public class AnchorCustomizerPlugin extends Plugin {
                 return false;
             }
 
-            String overlayId = overlay.getClass().getName();
+            String overlayId = overlayKey(overlay);
+            if (overlayId == null) return false;
 
             // If this overlay was previously assigned, start tracking it again
             if (overlayAssignments.containsKey(overlayId) && !trackedOverlays.containsKey(overlayId)) {
@@ -658,18 +912,52 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     /**
-     * Clean up tracked overlays that no longer exist in the overlay manager.
+     * Single pass over the OverlayManager that does BOTH:
+     * 1. Collects an identity set of present overlays so stale entries in
+     *    {@code trackedOverlays} can be removed.
+     * 2. Auto-tracks any movable overlay whose center lies inside an anchor region
+     *    (when assignment changes are allowed).
+     * Replaces three separate tick-rate overlay walks with one.
      */
-    private void cleanupTrackedOverlays() {
-        Iterator<Map.Entry<String, Overlay>> it = trackedOverlays.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<String, Overlay> entry = it.next();
-            Overlay overlay = entry.getValue();
-            // Check if overlay still exists using anyMatch (public API)
-            boolean exists = overlayManager.anyMatch(o -> o == overlay);
-            if (!exists) {
-                it.remove();
-                log.debug("Removed stale overlay reference: {}", entry.getKey());
+    private void runFusedOverlayWalk(List<AnchorRegion> regionsSnapshot, boolean lockAssignments) {
+        final Set<Overlay> present = Collections.newSetFromMap(new IdentityHashMap<>());
+        overlayManager.anyMatch(ov -> {
+            if (ov == null) return false;
+            present.add(ov);
+
+            if (lockAssignments) return false; // skip auto-track when not capturing
+            if (ov == customizerOverlay || !ov.isMovable()) return false;
+            Point loc = ov.getPreferredLocation();
+            if (loc == null) return false;
+            String id = overlayKey(ov);
+            if (id == null || trackedOverlays.containsKey(id)) return false;
+
+            Rectangle b = ov.getBounds();
+            if (b.isEmpty()) {
+                Dimension size = ov.getPreferredSize();
+                if (size == null) size = new Dimension(100, 20);
+                b = new Rectangle(loc.x, loc.y, size.width, size.height);
+            }
+            Point c = new Point((int) b.getCenterX(), (int) b.getCenterY());
+            for (AnchorRegion r : regionsSnapshot) {
+                if (r.getBounds().contains(c)) {
+                    trackedOverlays.put(id, ov);
+                    log.debug("Auto-tracked overlay {} (inside region {})", id, r.getName());
+                    break;
+                }
+            }
+            return false; // scan all
+        });
+
+        // Remove any tracked references whose overlays no longer exist in the manager.
+        if (!trackedOverlays.isEmpty()) {
+            Iterator<Map.Entry<String, Overlay>> it = trackedOverlays.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, Overlay> entry = it.next();
+                if (!present.contains(entry.getValue())) {
+                    it.remove();
+                    log.debug("Removed stale overlay reference: {}", entry.getKey());
+                }
             }
         }
     }
