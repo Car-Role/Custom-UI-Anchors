@@ -113,7 +113,9 @@ public class AnchorInputListener implements MouseListener {
             draggedAnchor = null;
             isResizing = false;
             resizeDirection = 0;
-            plugin.saveRegions();
+            // Fix R1: marshal the persistence write onto the client thread so it can't
+            // race against create/delete/load of anchorRegions from other paths.
+            plugin.saveRegionsFromAnyThread();
             e.consume();
         }
         return e;
@@ -167,9 +169,15 @@ public class AnchorInputListener implements MouseListener {
         if (!plugin.isOverlaysVisible()) {
             return e;
         }
+        // Canvas can briefly be null around client startup/shutdown; skip cursor updates
+        // rather than NPE.
+        java.awt.Canvas canvas = client.getCanvas();
+        if (canvas == null) {
+            return e;
+        }
         if (!client.isKeyPressed(KeyCode.KC_ALT)) {
             // Ensure cursor is reset if we released Alt while hovering
-            client.getCanvas().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+            canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
             return e;
         }
 
@@ -178,13 +186,13 @@ public class AnchorInputListener implements MouseListener {
             Rectangle bounds = region.getBounds();
             if (bounds.contains(e.getPoint()) || isNearResizeHandle(bounds, e.getPoint())) {
                 int dir = getResizeDirection(bounds, e.getPoint());
-                client.getCanvas().setCursor(getCursorForDirection(dir));
+                canvas.setCursor(getCursorForDirection(dir));
                 return e;
             }
         }
 
         // Reset cursor if not colliding with any region
-        client.getCanvas().setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
         return e;
     }
 

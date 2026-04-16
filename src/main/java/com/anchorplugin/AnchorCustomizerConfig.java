@@ -26,4 +26,12 @@ public interface AnchorCustomizerConfig extends Config {
 
     @ConfigItem(keyName = "overlayAssignments", name = "Overlay Assignments", description = "Internal storage for overlay assignments", hidden = true)
     void setOverlayAssignmentsJson(String json);
+
+    @ConfigItem(keyName = "selectedRegionId", name = "Selected Region Id", description = "Internal storage for the last selected anchor region in the panel", hidden = true)
+    default int selectedRegionId() {
+        return -1;
+    }
+
+    @ConfigItem(keyName = "selectedRegionId", name = "Selected Region Id", description = "Internal storage for the last selected anchor region in the panel", hidden = true)
+    void setSelectedRegionId(int id);
 }

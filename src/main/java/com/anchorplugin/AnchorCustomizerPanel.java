@@ -74,7 +74,10 @@ public class AnchorCustomizerPanel extends PluginPanel {
 
         regionList.addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting() && !isUpdating) {
-                setSelectedRegion(regionList.getSelectedValue());
+                // Route through the plugin so the selected region id is persisted (Fix SEL).
+                // plugin.selectAnchor schedules our setSelectedRegion back on the EDT, which
+                // is a no-op if the selection is already where we set it here.
+                plugin.selectAnchor(regionList.getSelectedValue());
             }
         });
 
@@ -188,7 +191,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
     }
 
     private JSpinner createSpinner(String title) {
-        JSpinner spinner = new JSpinner(new SpinnerNumberModel(0, -10000, 10000, 1));
+        // Range widened to comfortably cover ultra-wide and multi-monitor canvas sizes.
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(0, -50000, 50000, 1));
         spinner.setPreferredSize(new Dimension(85, 25));
         spinner.addChangeListener(e -> saveChanges());
         return spinner;
