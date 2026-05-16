@@ -9,25 +9,17 @@ https://github.com/user-attachments/assets/714d35a6-1b93-4244-bbfa-0a0fa91ce468
 
 ## Features
 
-- **Per-anchor offset configuration**: Set horizontal and vertical offsets for each of the 7 overlay anchor positions
-- **Visual anchor preview**: Toggle a debug overlay to see anchor points and their offsets
-- **Automatic viewport handling**: Positions update automatically when the game window resizes
-
-## Configuration
-
-The plugin adds offset controls for each anchor point:
-
-### Settings
-
-- **Enable Anchor Customization**: Toggle the plugin on/off
-- **Show Anchor Points**: Display visual indicators for debugging
-- **X/Y Offsets**: Each anchor has horizontal and vertical offset settings (-500 to +500 pixels)
+- **Custom anchor boxes**: Create any number of anchor regions and drag overlays into them to group them
+- **Window-resize constraints**: Pin each box to a corner, edge, or the center so it stays put when RuneLite is resized
+- **Alignment & stacking**: Control where overlays sit inside a box and how multiple overlays stack (vertical, horizontal, or wrapping fill)
+- **Live editing**: Hold Alt in-game to see and drag anchor boxes; edit position, size, and behavior from the side panel
 
 ## Usage
 
-1. Enable the plugin in RuneLite's plugin configuration
-2. Open the Custom UI Anchors settings panel
-3. Use Alt + Left Click Drag to change the visual layout
+1. Enable the plugin and open the Custom UI Anchors side panel
+2. Click **Add New Region Anchor** to create a box
+3. Hold **Alt** in-game to show the boxes, then drag a RuneLite overlay into one to assign it
+4. Alt + drag a box to move it, or use the panel to tweak its constraint, alignment, stacking, position, and size
 
 ## Installation
 
