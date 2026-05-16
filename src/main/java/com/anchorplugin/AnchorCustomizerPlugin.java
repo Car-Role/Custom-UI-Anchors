@@ -201,9 +201,12 @@ public class AnchorCustomizerPlugin extends Plugin {
             try {
                 SwingUtilities.invokeAndWait(panelInit);
             } catch (InvocationTargetException | InterruptedException e) {
-                if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
+                // Do NOT re-interrupt: startUp() runs on a RuneLite-owned thread
+                // (shared executor / client thread). Re-asserting the interrupt
+                // flag can cause unrelated blocking calls scheduled on this
+                // thread to throw spuriously. The RuntimeException below
+                // already signals startup failure unambiguously, and the
+                // original InterruptedException is preserved as the cause.
                 throw new RuntimeException("Failed to initialise Custom UI Anchors panel on EDT", e);
             }
         }
