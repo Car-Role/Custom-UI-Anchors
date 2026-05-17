@@ -3,9 +3,7 @@
 
 A RuneLite plugin that allows you to customize overlay anchor positions with configurable X/Y offsets so you can get a consistent UI when you resize RuneLite.
 
-
-https://github.com/user-attachments/assets/714d35a6-1b93-4244-bbfa-0a0fa91ce468
-
+https://github.com/user-attachments/assets/7ba959b9-2887-45c4-9f86-2a4a2857afd0
 
 ## Features
 
@@ -20,6 +18,8 @@ https://github.com/user-attachments/assets/714d35a6-1b93-4244-bbfa-0a0fa91ce468
 2. Click **Add New Region Anchor** to create a box
 3. Hold **Alt** in-game to show the boxes, then drag a RuneLite overlay into one to assign it
 4. Alt + drag a box to move it, or use the panel to tweak its constraint, alignment, stacking, position, and size
+
+https://github.com/user-attachments/assets/714d35a6-1b93-4244-bbfa-0a0fa91ce468
 
 ## Installation
 
