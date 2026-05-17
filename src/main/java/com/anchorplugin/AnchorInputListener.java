@@ -62,6 +62,17 @@ public class AnchorInputListener implements MouseListener {
             return e;
         }
 
+        // Overlay passthrough: if the user Alt+pressed directly on top of a movable
+        // RuneLite overlay (e.g. a detached InfoBoxOverlay rendered inside one of our
+        // anchor regions), yield to RuneLite's OverlayRenderer so it can start its
+        // own drag. Without this, we silently consume the event and the overlay
+        // appears uninteractable. We still let the click reach mouseClicked for
+        // selection, but only when the user is clicking empty space inside a region
+        // do we proceed with anchor drag/resize.
+        if (plugin.isMovableOverlayAt(mousePos)) {
+            return e;
+        }
+
         Rectangle bounds = region.getBounds();
         isDragging = true;
         draggedAnchor = region;
@@ -140,7 +151,9 @@ public class AnchorInputListener implements MouseListener {
         AnchorRegion picked = pickAnchorByClickCount(mousePos, e.getClickCount());
         if (picked != null) {
             plugin.selectAnchor(picked);
-            if (client.isKeyPressed(KeyCode.KC_ALT)) {
+            // Overlay passthrough (mirrors mousePressed): if the click landed on a
+            // movable overlay, do not consume — let RuneLite handle Alt+click on it.
+            if (client.isKeyPressed(KeyCode.KC_ALT) && !plugin.isMovableOverlayAt(mousePos)) {
                 e.consume();
             }
         } else if (client.isKeyPressed(KeyCode.KC_ALT)) {

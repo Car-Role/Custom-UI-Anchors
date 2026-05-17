@@ -999,6 +999,31 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     /**
+     * Returns true if there is any movable RuneLite overlay (other than our own
+     * customizer overlay) whose drawn bounds contain {@code p}.
+     *
+     * Used by {@link AnchorInputListener} to yield Alt+press / Alt+click events to
+     * RuneLite's {@code OverlayRenderer} when the user is clicking directly on an
+     * overlay that happens to be rendered inside an anchor region. Without this
+     * passthrough, anchor input would swallow the event and the overlay would
+     * become un-Alt-draggable (the "uninteractable infobox" bug).
+     *
+     * Thread-safety: invoked from the AWT event-dispatch thread. {@link OverlayManager#anyMatch}
+     * iterates a copy-on-write list, so concurrent ticks on the client thread are
+     * safe. Each overlay's {@code getBounds()} returns the last-rendered rectangle,
+     * which is the same rectangle RuneLite itself uses for overlay hit-testing.
+     */
+    public boolean isMovableOverlayAt(Point p) {
+        if (p == null) return false;
+        return overlayManager.anyMatch(ov -> {
+            if (ov == null || ov == customizerOverlay) return false;
+            if (!ov.isMovable()) return false;
+            Rectangle b = ov.getBounds();
+            return b != null && !b.isEmpty() && b.contains(p);
+        });
+    }
+
+    /**
      * Called when an overlay is dragged. Checks if it should be captured by an anchor region.
      * This is the entry point for tracking overlays without reflection.
      */
