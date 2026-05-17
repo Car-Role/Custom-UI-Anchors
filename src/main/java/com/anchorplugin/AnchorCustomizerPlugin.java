@@ -105,8 +105,13 @@ public class AnchorCustomizerPlugin extends Plugin {
     //   2. GameState gate: only track deltas while in LOGGED_IN (catches login-screen
     //      dwell on slow machines, where grace expires long before the user clicks Play).
     //   3. Plausibility clamp: skip any single delta whose magnitude exceeds half the
-    //      current canvas dimension (catches anything the other two miss, e.g. an
-    //      unexpected mid-session fullscreen/monitor swap we'd rather not auto-shift for).
+    //      LARGER of the old and new canvas dimensions (catches anything the other two
+    //      miss, e.g. an unexpected mid-session fullscreen/monitor swap we'd rather not
+    //      auto-shift for). The threshold is symmetric on purpose: an earlier version
+    //      used only the new dimension, which silently dropped the inverse half of any
+    //      large step (most visible on cross-monitor drags with mismatched DPI — the
+    //      grow-into-bigger-monitor delta passed but the shrink-back delta was clamped
+    //      out, stranding right/bottom-anchored regions hundreds of pixels off-screen).
     private static final long VIEWPORT_GRACE_MS = 1500L;
     private long startupTimeMs = 0L;
 
@@ -309,6 +314,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         int x = (viewport != null) ? Math.max(0, viewport.width / 2 - 50) : 100;
         int y = (viewport != null) ? Math.max(0, viewport.height / 2 - 50) : 100;
 
+        // Origins seeded to 0 here; rebaselineOrigin below captures the real values
+        // from current canvas dim immediately after the region is added.
         AnchorRegion region = new AnchorRegion(
                 nextId,
                 "Box " + nextId,
@@ -318,7 +325,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                 100,
                 AnchorConstraint.TOP_LEFT,
                 AnchorAlignment.CENTER,
-                AnchorStacking.VERTICAL);
+                AnchorStacking.VERTICAL,
+                0, 0, 0, 0);
+        rebaselineOrigin(region);
 
         anchorRegions.add(region);
         markRegionsDirty();
@@ -370,8 +379,119 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (region == null || updater == null) return;
         clientThread.invoke(() -> {
             updater.accept(region);
+            // Any panel commit (X/Y/W/H spinner, constraint, alignment, stacking, name)
+            // counts as a user-confirmed geometry. Rebaseline the origin so subsequent
+            // window resizes are derived from this state, not the pre-edit state.
+            rebaselineOrigin(region);
             saveRegions();
         });
+    }
+
+    /**
+     * Snapshot the region's current geometry as the new origin baseline. The tick-loop
+     * recompute derives live (x, y) every tick from (origin, currentCanvasDim, constraint),
+     * so this baseline is the only thing that anchors the region in canvas space.
+     *
+     * Called from every site where the user has confirmed a geometry: drag end, edge-resize
+     * end, panel field commits, region creation, and lazy migration of legacy regions on
+     * their first valid tick.
+     *
+     * If the current canvas dim is unavailable (e.g. very early startup), origins are
+     * left as-is — the next tick that observes a valid dim will retry. The recompute
+     * path treats originW <= 0 as "not seeded yet" and skips the region until then.
+     */
+    public void rebaselineOrigin(AnchorRegion region) {
+        if (region == null) return;
+        Rectangle viewport = getViewportBounds();
+        if (viewport == null) return;
+        int w = viewport.width;
+        int h = viewport.height;
+        if (w <= 0 || h <= 0) return;
+        region.setOriginX(region.getX());
+        region.setOriginY(region.getY());
+        region.setOriginW(w);
+        region.setOriginH(h);
+    }
+
+    /**
+     * AWT-thread-safe entry point for the input listener. Marshals onto the client
+     * thread to match where {@code anchorRegions} is iterated.
+     */
+    public void rebaselineOriginFromAnyThread(AnchorRegion region) {
+        if (region == null) return;
+        clientThread.invoke(() -> rebaselineOrigin(region));
+    }
+
+    /**
+     * Recompute a region's live (x, y) from its origin snapshot and the current canvas
+     * dim, applying the constraint's directional multiplier:
+     *
+     *   liveX = originX + (currentW - originW) * hMul
+     *   liveY = originY + (currentH - originH) * vMul
+     *
+     * where hMul / vMul are 0 (left/top), 0.5 (center), or 1 (right/bottom). This
+     * makes position a pure function of (origin, currentDim, constraint) — drift-free,
+     * immune to phantom dimension samples, and deterministic regardless of how many
+     * resize events the OS / GPU plugin / DPI subsystem fires.
+     *
+     * No-op if the region has not been seeded with valid origins (e.g. legacy data
+     * loaded before this field existed). The tick loop seeds those on first valid
+     * dim observation.
+     */
+    private void recomputePosition(AnchorRegion region, Dimension currentDim) {
+        if (region == null || currentDim == null) return;
+        int originW = region.getOriginW();
+        int originH = region.getOriginH();
+        if (originW <= 0 || originH <= 0) return;
+
+        AnchorConstraint constraint = region.getConstraint();
+        if (constraint == null) constraint = AnchorConstraint.TOP_LEFT;
+
+        int deltaW = currentDim.width - originW;
+        int deltaH = currentDim.height - originH;
+
+        int xShift;
+        switch (constraint) {
+            case TOP_RIGHT:
+            case CENTER_RIGHT:
+            case BOTTOM_RIGHT:
+                xShift = deltaW;
+                break;
+            case TOP_CENTER:
+            case CENTER:
+            case BOTTOM_CENTER:
+                xShift = deltaW / 2;
+                break;
+            case TOP_LEFT:
+            case CENTER_LEFT:
+            case BOTTOM_LEFT:
+            default:
+                xShift = 0;
+                break;
+        }
+
+        int yShift;
+        switch (constraint) {
+            case BOTTOM_LEFT:
+            case BOTTOM_CENTER:
+            case BOTTOM_RIGHT:
+                yShift = deltaH;
+                break;
+            case CENTER_LEFT:
+            case CENTER:
+            case CENTER_RIGHT:
+                yShift = deltaH / 2;
+                break;
+            case TOP_LEFT:
+            case TOP_CENTER:
+            case TOP_RIGHT:
+            default:
+                yShift = 0;
+                break;
+        }
+
+        region.setX(region.getOriginX() + xShift);
+        region.setY(region.getOriginY() + yShift);
     }
 
     private void loadRegions() {
@@ -512,33 +632,66 @@ public class AnchorCustomizerPlugin extends Plugin {
     public void onClientTick(ClientTick event) {
         boolean isResizingWindow = false;
 
-        // Handle Window Resize Constraints
+        // Handle Window Resize Constraints — derivation model.
+        //
+        // Old design accumulated per-tick deltas onto a stored absolute (x, y),
+        // which baked any noisy `getRealDimensions()` sample (DPI swap on cross-monitor
+        // drag, GPU FBO/AA reset transients) into permanent state. Anything the
+        // plausibility clamp didn't filter became drift or sudden displacement —
+        // see `progress.txt` history if curious.
+        //
+        // New design: each region carries an origin snapshot (originX/Y/W/H) captured
+        // at the most recent user edit. Each tick we recompute live (x, y) as a pure
+        // function of (origin, currentDim, constraint). Phantom dim samples produce
+        // a one-tick visual blip that auto-corrects on the next sample; nothing
+        // accumulates, nothing is persisted from intermediate state.
+        //
+        // Startup-grace and LOGGED_IN guards remain — not because the math needs them
+        // (it doesn't drift), but because we don't want to seed origins from a
+        // degenerate canvas dim during early client init.
         Rectangle currentViewport = getViewportBounds();
         if (currentViewport != null) {
             Dimension currentDim = currentViewport.getSize();
-            if (lastViewport == null) {
-                // First observation ever; just seed.
-                lastViewport = currentDim;
-            } else if (!lastViewport.equals(currentDim)) {
-                // Three defense layers against false-positive "resizes" that would corrupt
-                // saved anchor positions. See field-level comment on VIEWPORT_GRACE_MS.
+            if (currentDim.width > 0 && currentDim.height > 0) {
                 boolean inStartupGrace =
                         (System.currentTimeMillis() - startupTimeMs) < VIEWPORT_GRACE_MS;
                 boolean loggedIn = client.getGameState() == GameState.LOGGED_IN;
-                int deltaW = Math.abs(currentDim.width - lastViewport.width);
-                int deltaH = Math.abs(currentDim.height - lastViewport.height);
-                // Guard against division by zero / degenerate dims during client init.
-                int halfW = Math.max(1, currentDim.width / 2);
-                int halfH = Math.max(1, currentDim.height / 2);
-                boolean plausibleDelta = deltaW <= halfW && deltaH <= halfH;
 
-                if (inStartupGrace || !loggedIn || !plausibleDelta) {
-                    // Silently track the new dimension; do NOT shift or persist regions.
-                    lastViewport = currentDim;
-                } else {
-                    isResizingWindow = updateRegionPositions(lastViewport, currentDim);
+                if (lastViewport == null) {
                     lastViewport = currentDim;
                 }
+
+                if (!inStartupGrace && loggedIn) {
+                    // Lazy-seed origins for any region missing them (legacy data, or
+                    // regions created when canvas dim was unavailable). One-shot per
+                    // region — once seeded, the recompute path takes over.
+                    boolean seededAny = false;
+                    for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
+                        if (region.getOriginW() <= 0 || region.getOriginH() <= 0) {
+                            rebaselineOrigin(region);
+                            seededAny = true;
+                        }
+                    }
+                    if (seededAny) {
+                        saveRegions();
+                    }
+
+                    // Recompute every region from its origin + currentDim. Skip the
+                    // region the user is actively dragging or edge-resizing — the input
+                    // listener owns its (x, y) until release, at which point it
+                    // rebaselines. Without this skip the recompute would fight the drag.
+                    AnchorRegion dragged = inputListener.getDraggedAnchor();
+                    if (!lastViewport.equals(currentDim)) {
+                        for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
+                            if (region == dragged) continue;
+                            recomputePosition(region, currentDim);
+                        }
+                        isResizingWindow = true;
+                        lastResizeTime = System.currentTimeMillis();
+                        markRegionsDirty();
+                    }
+                }
+                lastViewport = currentDim;
             }
         }
 
@@ -547,61 +700,6 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     private long lastResizeTime = 0;
-
-    private boolean updateRegionPositions(Dimension oldDim, Dimension newDim) {
-        if (oldDim.equals(newDim))
-            return false;
-
-        lastResizeTime = System.currentTimeMillis();
-
-        // Snapshot to avoid concurrent modification if panel edits fire during iteration
-        for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
-            updateRegionConstraint(region, oldDim, newDim);
-        }
-        markRegionsDirty(); // Persist new positions (debounced)
-        return true;
-    }
-
-    private void updateRegionConstraint(AnchorRegion region, Dimension oldDim, Dimension newDim) {
-        AnchorConstraint constraint = region.getConstraint();
-        if (constraint == null)
-            constraint = AnchorConstraint.TOP_LEFT;
-
-        int deltaW = newDim.width - oldDim.width;
-        int deltaH = newDim.height - oldDim.height;
-
-        // Vertical Logic
-        switch (constraint) {
-            case BOTTOM_LEFT:
-            case BOTTOM_CENTER:
-            case BOTTOM_RIGHT:
-                region.setY(region.getY() + deltaH);
-                break;
-            case CENTER_LEFT:
-            case CENTER:
-            case CENTER_RIGHT:
-                region.setY(region.getY() + deltaH / 2);
-                break;
-            default:
-                break;
-        }
-
-        // Horizontal Logic
-        switch (constraint) {
-            case TOP_RIGHT:
-            case CENTER_RIGHT:
-            case BOTTOM_RIGHT:
-                region.setX(region.getX() + deltaW);
-                break;
-            case TOP_CENTER:
-            case BOTTOM_CENTER:
-            case CENTER:
-                region.setX(region.getX() + deltaW / 2);
-                break;
-            default:
-                break;
-        }
-    }
 
     // Map<OverlayKey, RegionId> to track which region owns an overlay (persisted)
     private final Map<String, Integer> overlayAssignments = new ConcurrentHashMap<>();

@@ -124,10 +124,19 @@ public class AnchorInputListener implements MouseListener {
         if (!plugin.isOverlaysVisible() && !isDragging)
             return e;
         if (isDragging) {
+            // Capture the dragged region before clearing state so we can rebaseline
+            // its origin to the new (x, y) the user just confirmed. The recompute path
+            // in onClientTick was skipping this region while isDragging was true; the
+            // rebaseline below makes the next tick's recompute a no-op (origin matches
+            // current x/y), then constraint-driven shifts kick in normally on resize.
+            AnchorRegion confirmed = draggedAnchor;
             isDragging = false;
             draggedAnchor = null;
             isResizing = false;
             resizeDirection = 0;
+            if (confirmed != null) {
+                plugin.rebaselineOriginFromAnyThread(confirmed);
+            }
             // Fix R1: marshal the persistence write onto the client thread so it can't
             // race against create/delete/load of anchorRegions from other paths.
             plugin.saveRegionsFromAnyThread();
