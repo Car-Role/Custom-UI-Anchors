@@ -14,7 +14,6 @@ import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
 import net.runelite.api.Client;
-import net.runelite.api.KeyCode;
 import net.runelite.client.input.MouseListener;
 
 public class AnchorInputListener implements MouseListener {
@@ -52,7 +51,7 @@ public class AnchorInputListener implements MouseListener {
     public MouseEvent mousePressed(MouseEvent e) {
         if (!plugin.isOverlaysVisible())
             return e;
-        if (!client.isKeyPressed(KeyCode.KC_ALT) || SwingUtilities.isRightMouseButton(e)) {
+        if (!plugin.isDragKeyHeld() || SwingUtilities.isRightMouseButton(e)) {
             return e;
         }
 
@@ -162,10 +161,10 @@ public class AnchorInputListener implements MouseListener {
             plugin.selectAnchor(picked);
             // Overlay passthrough (mirrors mousePressed): if the click landed on a
             // movable overlay, do not consume — let RuneLite handle Alt+click on it.
-            if (client.isKeyPressed(KeyCode.KC_ALT) && !plugin.isMovableOverlayAt(mousePos)) {
+            if (plugin.isDragKeyHeld() && !plugin.isMovableOverlayAt(mousePos)) {
                 e.consume();
             }
-        } else if (client.isKeyPressed(KeyCode.KC_ALT)) {
+        } else if (plugin.isDragKeyHeld()) {
             // Only deselect if Alt is held (explicit edit intention); clicking into
             // empty space without Alt should not drop the panel selection.
             plugin.selectAnchor(null);
@@ -228,7 +227,7 @@ public class AnchorInputListener implements MouseListener {
         if (canvas == null) {
             return e;
         }
-        if (!client.isKeyPressed(KeyCode.KC_ALT)) {
+        if (!plugin.isDragKeyHeld()) {
             // Ensure cursor is reset if we released Alt while hovering
             canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
             return e;

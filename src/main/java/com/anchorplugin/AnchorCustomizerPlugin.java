@@ -37,11 +37,11 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.ClientTick;
-import net.runelite.api.KeyCode;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -79,6 +79,12 @@ public class AnchorCustomizerPlugin extends Plugin {
     private AnchorInputListener inputListener;
 
     @Inject
+    private KeyManager keyManager;
+
+    @Inject
+    private AnchorKeyListener anchorKeyListener;
+
+    @Inject
     private ClientToolbar clientToolbar;
 
     @Inject
@@ -86,6 +92,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     private AnchorCustomizerPanel panel;
     private NavigationButton navButton;
+    private volatile boolean navButtonAdded = false;
 
     @Inject
     private Gson gson;
@@ -119,9 +126,11 @@ public class AnchorCustomizerPlugin extends Plugin {
     private static final long SAVE_DEBOUNCE_MS = 500L;
     private boolean regionsDirty = false;
     private boolean assignmentsDirty = false;
+    private boolean orderDirty = false;
     private long lastFlushTime = 0L;
     private String lastWrittenRegionJson = null;
     private String lastWrittenAssignmentsJson = null;
+    private String lastWrittenOrderJson = null;
 
     // Periodic re-acquire throttle for overlays that load after startup
     private long lastReacquireTime = 0L;
@@ -140,8 +149,16 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     public boolean isOverlaysVisible() {
         boolean isPanelOpen = panel != null && panel.isShowing();
-        boolean isAltHeld = client.isKeyPressed(KeyCode.KC_ALT);
-        return isPanelOpen || isAltHeld;
+        return isPanelOpen || isDragKeyHeld();
+    }
+
+    /**
+     * Whether RuneLite's configured drag hotkey is currently held. Replaces the old
+     * hardcoded Alt check so the plugin honours the user's "Drag hotkey" setting
+     * (GitHub issue #4). Falls back to Alt when the hotkey is unset.
+     */
+    public boolean isDragKeyHeld() {
+        return anchorKeyListener != null && anchorKeyListener.isHeld();
     }
 
     public boolean isAnchorBeingDragged() {
@@ -175,6 +192,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         regionsDirty = false;
         assignmentsDirty = false;
         needsSnap = false;
+        navButtonAdded = false;
 
         // Load icon (off-EDT work — just a resource read, safe on the client thread)
         BufferedImage icon = null;
@@ -216,12 +234,18 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
         }
 
-        clientToolbar.addNavigation(navButton);
+        if (config.showSidebarButton()) {
+            clientToolbar.addNavigation(navButton);
+            navButtonAdded = true;
+        }
 
         overlayManager.add(customizerOverlay);
         mouseManager.registerMouseListener(inputListener);
+        anchorKeyListener.reset();
+        keyManager.registerKeyListener(anchorKeyListener);
         loadRegions();
         loadOverlayAssignments();
+        loadOverlayOrder();
 
         // Try to re-acquire overlay references for persisted assignments
         scanAndReacquireOverlays();
@@ -254,10 +278,15 @@ public class AnchorCustomizerPlugin extends Plugin {
         flushPendingSaves(true);
         overlayManager.remove(customizerOverlay);
         mouseManager.unregisterMouseListener(inputListener);
-        clientToolbar.removeNavigation(navButton);
+        keyManager.unregisterKeyListener(anchorKeyListener);
+        if (navButtonAdded) {
+            clientToolbar.removeNavigation(navButton);
+            navButtonAdded = false;
+        }
         anchorRegions.clear();
         trackedOverlays.clear();
         overlayAssignments.clear();
+        overlayOrder.clear();
         lastSeenLocations.clear();
         lastExternalMoveTime.clear();
     }
@@ -285,6 +314,33 @@ public class AnchorCustomizerPlugin extends Plugin {
                 return;
             }
             clientThread.invoke(this::loadOverlayAssignments);
+        } else if (event.getKey().equals("overlayOrder")) {
+            String incoming = event.getNewValue();
+            if (incoming != null && incoming.equals(lastWrittenOrderJson)) {
+                return;
+            }
+            clientThread.invoke(this::loadOverlayOrder);
+        } else if (event.getKey().equals("showSidebarButton")) {
+            SwingUtilities.invokeLater(this::syncSidebarButton);
+        }
+    }
+
+    /**
+     * Add or remove the sidebar navigation button to match the {@code showSidebarButton}
+     * config (GitHub issue #3). Idempotent via {@code navButtonAdded} so repeated config
+     * events can't double-add or double-remove. Runs on the EDT (Swing contract).
+     */
+    private void syncSidebarButton() {
+        if (navButton == null) {
+            return;
+        }
+        boolean shouldShow = config.showSidebarButton();
+        if (shouldShow && !navButtonAdded) {
+            clientToolbar.addNavigation(navButton);
+            navButtonAdded = true;
+        } else if (!shouldShow && navButtonAdded) {
+            clientToolbar.removeNavigation(navButton);
+            navButtonAdded = false;
         }
     }
 
@@ -603,6 +659,12 @@ public class AnchorCustomizerPlugin extends Plugin {
             config.setOverlayAssignmentsJson(json);
             assignmentsDirty = false;
         }
+        if (orderDirty) {
+            String json = gson.toJson(overlayOrder);
+            lastWrittenOrderJson = json;
+            config.setOverlayOrderJson(json);
+            orderDirty = false;
+        }
         lastFlushTime = now;
     }
 
@@ -703,6 +765,10 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     // Map<OverlayKey, RegionId> to track which region owns an overlay (persisted)
     private final Map<String, Integer> overlayAssignments = new ConcurrentHashMap<>();
+    // Persisted display order of overlays within their assigned region (GitHub issue #5):
+    // overlayKey -> order index. Sorted by this instead of live position so window
+    // resizes can't scramble the arrangement.
+    private final Map<String, Integer> overlayOrder = new ConcurrentHashMap<>();
     // Map<OverlayKey, Overlay> to store direct references to captured overlays (runtime only)
     private final Map<String, Overlay> trackedOverlays = new ConcurrentHashMap<>();
 
@@ -890,53 +956,58 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (stacking == null)
                 stacking = AnchorStacking.VERTICAL;
 
-            // Sort along the stacking axis so that reordering (e.g. dragging one overlay
-            // past another) reflects the user's intent. Horizontal stacks sort by X,
-            // vertical and fill layouts sort by Y.
-            final AnchorStacking sortStacking = stacking;
-            overlays.sort((a, b) -> {
-                Rectangle ba = a.getBounds();
-                Rectangle bb = b.getBounds();
-                if (sortStacking == AnchorStacking.HORIZONTAL) {
-                    return Integer.compare(ba.x, bb.x);
-                }
-                return Integer.compare(ba.y, bb.y);
-            });
+            // Establish item order (GitHub issue #5). While the user is actively arranging
+            // overlays here, order follows their live positions and is persisted; otherwise
+            // we sort by the persisted order so a window resize can't scramble it.
+            orderOverlays(region, overlays, stacking, hotIds);
 
-            // 1. Calculate Layout Dimensions & Individual Positions relative to (0,0)
-            List<Rectangle> relativeBounds = new ArrayList<>();
+            AnchorAlignment align = region.getAlignment();
+            if (align == null)
+                align = AnchorAlignment.CENTER;
+            final int hAlign = hAlignCode(align);
+            final int vAlign = vAlignCode(align);
+
+            // 1. First pass: lay items out along the stacking (main) axis and record each
+            // item's size and, for fill modes, which row/column it landed in. Cross-axis
+            // placement is deferred to pass 3 once group extents are known.
+            int n = overlays.size();
+            int[] ws = new int[n];
+            int[] hs = new int[n];
+            int[] mainX = new int[n];
+            int[] mainY = new int[n];
+            int[] groupIdx = new int[n];
+
             int totalLayoutWidth = 0;
             int totalLayoutHeight = 0;
-
             int currentX = 0;
             int currentY = 0;
-            int rowMaxH = 0; // For horizontal flow
-            int colMaxW = 0; // For vertical flow
+            int rowMaxH = 0; // For horizontal fill flow
+            int colMaxW = 0; // For vertical fill flow
+            int group = 0;
 
-            for (Overlay overlay : overlays) {
+            for (int i = 0; i < n; i++) {
+                Overlay overlay = overlays.get(i);
                 int w = overlay.getBounds().width;
                 if (w <= 0)
                     w = overlay.getPreferredSize() != null ? overlay.getPreferredSize().width : 100;
                 int h = overlay.getBounds().height;
                 if (h <= 0)
                     h = overlay.getPreferredSize() != null ? overlay.getPreferredSize().height : 24;
-
-                int xPos = 0, yPos = 0;
+                ws[i] = w;
+                hs[i] = h;
 
                 switch (stacking) {
                     case VERTICAL:
-                        // Vertical stack: Items stacked at x=0, y=currentY
-                        xPos = 0;
-                        yPos = currentY;
+                        mainX[i] = 0;
+                        mainY[i] = currentY;
                         currentY += h + PADDING;
                         totalLayoutWidth = Math.max(totalLayoutWidth, w);
                         totalLayoutHeight = currentY - PADDING;
                         break;
 
                     case HORIZONTAL:
-                        // Horizontal stack: Items stacked at x=currentX, y=0
-                        xPos = currentX;
-                        yPos = 0;
+                        mainX[i] = currentX;
+                        mainY[i] = 0;
                         currentX += w + PADDING;
                         totalLayoutHeight = Math.max(totalLayoutHeight, h);
                         totalLayoutWidth = currentX - PADDING;
@@ -948,101 +1019,91 @@ public class AnchorCustomizerPlugin extends Plugin {
                             currentX = 0;
                             currentY += rowMaxH + PADDING;
                             rowMaxH = 0;
+                            group++;
                         }
-                        xPos = currentX;
-                        yPos = currentY;
+                        mainX[i] = currentX;
+                        mainY[i] = currentY;
                         currentX += w + PADDING;
                         rowMaxH = Math.max(rowMaxH, h);
-                        totalLayoutWidth = Math.max(totalLayoutWidth, xPos + w);
-                        totalLayoutHeight = Math.max(totalLayoutHeight, yPos + h);
+                        groupIdx[i] = group;
+                        totalLayoutWidth = Math.max(totalLayoutWidth, mainX[i] + w);
+                        totalLayoutHeight = Math.max(totalLayoutHeight, mainY[i] + h);
                         break;
 
                     case FILL_VERTICAL:
                         if (currentY + h > region.getHeight() && currentY > 0) {
-                            // Wrap to next col
+                            // Wrap to next column
                             currentY = 0;
                             currentX += colMaxW + PADDING;
                             colMaxW = 0;
+                            group++;
                         }
-                        xPos = currentX;
-                        yPos = currentY;
+                        mainX[i] = currentX;
+                        mainY[i] = currentY;
                         currentY += h + PADDING;
                         colMaxW = Math.max(colMaxW, w);
-                        totalLayoutWidth = Math.max(totalLayoutWidth, xPos + w);
-                        totalLayoutHeight = Math.max(totalLayoutHeight, yPos + h);
+                        groupIdx[i] = group;
+                        totalLayoutWidth = Math.max(totalLayoutWidth, mainX[i] + w);
+                        totalLayoutHeight = Math.max(totalLayoutHeight, mainY[i] + h);
                         break;
                 }
-                relativeBounds.add(new Rectangle(xPos, yPos, w, h));
             }
 
-            // 2. Align the Calculated Layout Block within the Region
-            AnchorAlignment align = region.getAlignment();
-            if (align == null)
-                align = AnchorAlignment.CENTER;
+            // 2. Cross-axis extent of each fill row/column (tallest item per row for
+            // FILL_HORIZONTAL, widest per column for FILL_VERTICAL). Lets mixed-size items
+            // align within their row/column instead of pinning to its leading edge, which
+            // is what made the vital bars sit a few pixels high (GitHub issue #5).
+            Map<Integer, Integer> groupCross = new HashMap<>();
+            if (stacking == AnchorStacking.FILL_HORIZONTAL) {
+                for (int i = 0; i < n; i++) {
+                    groupCross.merge(groupIdx[i], hs[i], Math::max);
+                }
+            } else if (stacking == AnchorStacking.FILL_VERTICAL) {
+                for (int i = 0; i < n; i++) {
+                    groupCross.merge(groupIdx[i], ws[i], Math::max);
+                }
+            }
 
+            // Align the whole layout block within the region.
             int startX = region.getX();
             int startY = region.getY();
-
-            // Horizontal Alignment of the Block
-            switch (align) {
-                case TOP_RIGHT:
-                case CENTER_RIGHT:
-                case BOTTOM_RIGHT:
-                    startX = region.getX() + region.getWidth() - totalLayoutWidth;
-                    break;
-                case TOP_CENTER:
-                case BOTTOM_CENTER:
-                case CENTER:
-                case STRETCH:
-                    startX = region.getX() + (region.getWidth() - totalLayoutWidth) / 2;
-                    break;
-                case TOP_LEFT:
-                case CENTER_LEFT:
-                case BOTTOM_LEFT:
-                default:
-                    // default startX = region.getX()
-                    break;
+            if (hAlign == 2) {
+                startX = region.getX() + region.getWidth() - totalLayoutWidth;
+            } else if (hAlign == 1) {
+                startX = region.getX() + (region.getWidth() - totalLayoutWidth) / 2;
+            }
+            if (vAlign == 2) {
+                startY = region.getY() + region.getHeight() - totalLayoutHeight;
+            } else if (vAlign == 1) {
+                startY = region.getY() + (region.getHeight() - totalLayoutHeight) / 2;
             }
 
-            // Vertical Alignment of the Block
-            switch (align) {
-                case BOTTOM_LEFT:
-                case BOTTOM_CENTER:
-                case BOTTOM_RIGHT:
-                    startY = region.getY() + region.getHeight() - totalLayoutHeight;
-                    break;
-                case CENTER_LEFT:
-                case CENTER:
-                case CENTER_RIGHT:
-                case STRETCH:
-                    startY = region.getY() + (region.getHeight() - totalLayoutHeight) / 2;
-                    break;
-                case TOP_LEFT:
-                case TOP_CENTER:
-                case TOP_RIGHT:
-                default:
-                    // default startY = region.getY()
-                    break;
-            }
-
-            // 3. Apply positions
-            for (int i = 0; i < overlays.size(); i++) {
+            // 3. Resolve each item's cross-axis position from the region alignment, then
+            // apply. Items now honour left/right (vertical stack) or top/bottom (horizontal
+            // stack) alignment relative to one another instead of always centering
+            // (GitHub issue #5).
+            for (int i = 0; i < n; i++) {
                 Overlay overlay = overlays.get(i);
-                Rectangle rel = relativeBounds.get(i);
+                int relX = mainX[i];
+                int relY = mainY[i];
 
-                int targetX = startX + rel.x;
-                int targetY = startY + rel.y;
+                switch (stacking) {
+                    case VERTICAL:
+                        relX = crossAlignOffset(totalLayoutWidth, ws[i], hAlign);
+                        break;
+                    case HORIZONTAL:
+                        relY = crossAlignOffset(totalLayoutHeight, hs[i], vAlign);
+                        break;
+                    case FILL_HORIZONTAL:
+                        relY = mainY[i] + crossAlignOffset(groupCross.getOrDefault(groupIdx[i], hs[i]), hs[i], vAlign);
+                        break;
+                    case FILL_VERTICAL:
+                        relX = mainX[i] + crossAlignOffset(groupCross.getOrDefault(groupIdx[i], ws[i]), ws[i], hAlign);
+                        break;
+                }
 
-                // Special case: Vertical Stack usually wants items centered horizontally
-                // relative to EACH OTHER
-                if (stacking == AnchorStacking.VERTICAL) {
-                    targetX = startX + (totalLayoutWidth - rel.width) / 2;
-                }
-                // Special case: Horizontal Stack items centered vertically relative to EACH
-                // OTHER
-                if (stacking == AnchorStacking.HORIZONTAL) {
-                    targetY = startY + (totalLayoutHeight - rel.height) / 2;
-                }
+                int targetX = startX + relX;
+                int targetY = startY + relY;
 
                 if (overlay.getPreferredPosition() != OverlayPosition.DYNAMIC) {
                     overlay.setPreferredPosition(OverlayPosition.DYNAMIC);
@@ -1076,6 +1137,156 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (loc != null) {
                 lastSeenLocations.put(entry.getKey(), new Point(loc));
             }
+        }
+    }
+
+    /**
+     * Establish the display order of overlays within a region (GitHub issue #5). When the
+     * user is actively arranging overlays here (one is "hot" - moved within the assignment
+     * grace window) order is derived from live positions along the stacking axis and
+     * persisted. Otherwise we sort by the persisted order, so a window resize (which moves
+     * anchors, not overlay preferred locations, and therefore leaves nothing "hot") can no
+     * longer reshuffle the arrangement.
+     */
+    private void orderOverlays(AnchorRegion region, List<Overlay> overlays, AnchorStacking stacking, Set<String> hotIds) {
+        if (overlays.size() < 2) {
+            return;
+        }
+        final boolean horizontal = stacking == AnchorStacking.HORIZONTAL
+                || stacking == AnchorStacking.FILL_HORIZONTAL;
+
+        boolean anyHot = false;
+        for (Overlay o : overlays) {
+            String id = overlayKey(o);
+            if (id != null && hotIds.contains(id)) {
+                anyHot = true;
+                break;
+            }
+        }
+
+        if (anyHot) {
+            overlays.sort((a, b) -> compareByPosition(a, b, horizontal));
+            for (int i = 0; i < overlays.size(); i++) {
+                String id = overlayKey(overlays.get(i));
+                if (id == null) continue;
+                Integer prev = overlayOrder.get(id);
+                if (prev == null || prev != i) {
+                    overlayOrder.put(id, i);
+                    orderDirty = true;
+                }
+            }
+            return;
+        }
+
+        // Stable: seed any missing order (legacy data) once from current positions, then
+        // sort by the persisted order.
+        seedMissingOrder(overlays, horizontal);
+        overlays.sort((a, b) -> {
+            int oa = orderOf(a);
+            int ob = orderOf(b);
+            if (oa != ob) {
+                return Integer.compare(oa, ob);
+            }
+            return compareByPosition(a, b, horizontal);
+        });
+    }
+
+    private int compareByPosition(Overlay a, Overlay b, boolean horizontal) {
+        Rectangle ba = a.getBounds();
+        Rectangle bb = b.getBounds();
+        return horizontal ? Integer.compare(ba.x, bb.x) : Integer.compare(ba.y, bb.y);
+    }
+
+    private int orderOf(Overlay o) {
+        String id = overlayKey(o);
+        if (id == null) return Integer.MAX_VALUE;
+        Integer v = overlayOrder.get(id);
+        return v == null ? Integer.MAX_VALUE : v;
+    }
+
+    /**
+     * If any overlay in the bucket lacks a persisted order, assign the whole bucket an
+     * order from current live positions. One-shot migration for configs saved before the
+     * ordering feature existed.
+     */
+    private void seedMissingOrder(List<Overlay> overlays, boolean horizontal) {
+        boolean missing = false;
+        for (Overlay o : overlays) {
+            String id = overlayKey(o);
+            if (id != null && !overlayOrder.containsKey(id)) {
+                missing = true;
+                break;
+            }
+        }
+        if (!missing) return;
+        List<Overlay> sorted = new ArrayList<>(overlays);
+        sorted.sort((a, b) -> compareByPosition(a, b, horizontal));
+        for (int i = 0; i < sorted.size(); i++) {
+            String id = overlayKey(sorted.get(i));
+            if (id != null) {
+                overlayOrder.put(id, i);
+                orderDirty = true;
+            }
+        }
+    }
+
+    /** Horizontal alignment code for a region alignment: 0=left, 1=center, 2=right. */
+    private static int hAlignCode(AnchorAlignment a) {
+        switch (a) {
+            case TOP_LEFT:
+            case CENTER_LEFT:
+            case BOTTOM_LEFT:
+                return 0;
+            case TOP_RIGHT:
+            case CENTER_RIGHT:
+            case BOTTOM_RIGHT:
+                return 2;
+            default:
+                return 1;
+        }
+    }
+
+    /** Vertical alignment code for a region alignment: 0=top, 1=center, 2=bottom. */
+    private static int vAlignCode(AnchorAlignment a) {
+        switch (a) {
+            case TOP_LEFT:
+            case TOP_CENTER:
+            case TOP_RIGHT:
+                return 0;
+            case BOTTOM_LEFT:
+            case BOTTOM_CENTER:
+            case BOTTOM_RIGHT:
+                return 2;
+            default:
+                return 1;
+        }
+    }
+
+    /**
+     * Offset of an item of {@code size} within an {@code extent}-long track for the given
+     * cross-axis alignment code (0=start, 1=center, 2=end).
+     */
+    private static int crossAlignOffset(int extent, int size, int code) {
+        if (code == 0) return 0;
+        if (code == 2) return extent - size;
+        return (extent - size) / 2;
+    }
+
+    private void loadOverlayOrder() {
+        String json = config.overlayOrderJson();
+        if (json == null || json.isEmpty()) {
+            return;
+        }
+        try {
+            Type type = new TypeToken<Map<String, Integer>>() {
+            }.getType();
+            Map<String, Integer> loaded = gson.fromJson(json, type);
+            if (loaded != null) {
+                overlayOrder.clear();
+                overlayOrder.putAll(loaded);
+            }
+        } catch (Exception e) {
+            log.error("Failed to load overlay order", e);
         }
     }
 
