@@ -141,7 +141,52 @@ public class AnchorInputListener implements MouseListener {
             plugin.saveRegionsFromAnyThread();
             e.consume();
         }
+        // If the hotkey is no longer held (e.g. the user released Alt mid-drag and then
+        // let go of the mouse without moving it), mouseMoved won't fire to clear the
+        // move/resize cursor — reset it here so it can't get stuck.
+        if (!plugin.isDragKeyHeld()) {
+            resetCursorToDefault();
+        }
         return e;
+    }
+
+    /**
+     * Reset the canvas cursor to the default arrow. Safe to call from the AWT event thread
+     * (the same thread the other cursor mutations in this class run on). No-op if the canvas
+     * is briefly unavailable around client startup/shutdown.
+     */
+    public void resetCursorToDefault() {
+        java.awt.Canvas canvas = client.getCanvas();
+        if (canvas != null) {
+            canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+        }
+    }
+
+    /**
+     * Abort an in-progress drag/resize, reverting the anchor to the geometry it had when the
+     * Alt+press started ({@link #originalBounds}). Invoked when the edit hotkey is released
+     * or focus is lost mid-drag — the user's intent is "cancel", not "drop here", so we
+     * deliberately do NOT rebaseline or persist the aborted position (unlike a normal
+     * {@link #mouseReleased}). A snap is requested so any overlays reflow back to the
+     * restored anchor. No-op when nothing is being dragged.
+     */
+    public void cancelDrag() {
+        if (!isDragging || draggedAnchor == null) {
+            return;
+        }
+        AnchorRegion cancelled = draggedAnchor;
+        if (originalBounds != null) {
+            cancelled.setX(originalBounds.x);
+            cancelled.setY(originalBounds.y);
+            cancelled.setWidth(originalBounds.width);
+            cancelled.setHeight(originalBounds.height);
+        }
+        isDragging = false;
+        draggedAnchor = null;
+        isResizing = false;
+        resizeDirection = 0;
+        plugin.requestSnap();
+        plugin.refreshSelectedAnchorProperties(cancelled);
     }
 
     @Override

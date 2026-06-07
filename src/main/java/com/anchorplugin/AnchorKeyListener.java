@@ -33,9 +33,18 @@ public class AnchorKeyListener implements KeyListener {
     // thread (isOverlaysVisible) and the AWT mouse thread (AnchorInputListener).
     private volatile boolean held = false;
 
+    // Invoked on the AWT event thread whenever the hotkey is released or focus is lost.
+    // The plugin wires this to reset the cursor and cancel any in-progress drag, so a
+    // stationary mouse on Alt-release can't strand the move/resize cursor.
+    private volatile Runnable onReleased;
+
     @Inject
     AnchorKeyListener(RuneLiteConfig runeLiteConfig) {
         this.runeLiteConfig = runeLiteConfig;
+    }
+
+    public void setOnReleased(Runnable onReleased) {
+        this.onReleased = onReleased;
     }
 
     /**
@@ -81,11 +90,20 @@ public class AnchorKeyListener implements KeyListener {
     public void keyReleased(KeyEvent e) {
         if (dragHotkey().matches(e)) {
             held = false;
+            fireReleased();
         }
     }
 
     @Override
     public void focusLost() {
         held = false;
+        fireReleased();
+    }
+
+    private void fireReleased() {
+        Runnable r = onReleased;
+        if (r != null) {
+            r.run();
+        }
     }
 }

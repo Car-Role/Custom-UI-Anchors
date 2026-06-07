@@ -36,6 +36,7 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.ClientTick;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -49,7 +50,6 @@ import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.util.ImageUtil;
 
 @Slf4j
@@ -242,6 +242,13 @@ public class AnchorCustomizerPlugin extends Plugin {
         overlayManager.add(customizerOverlay);
         mouseManager.registerMouseListener(inputListener);
         anchorKeyListener.reset();
+        // When the edit hotkey is released (or focus is lost), cancel any in-progress drag
+        // and reset the cursor. cancelDrag() is a no-op when nothing is being dragged, so
+        // this also covers the "stuck cursor while only hovering" case.
+        anchorKeyListener.setOnReleased(() -> {
+            inputListener.cancelDrag();
+            inputListener.resetCursorToDefault();
+        });
         keyManager.registerKeyListener(anchorKeyListener);
         loadRegions();
         loadOverlayAssignments();
@@ -761,6 +768,56 @@ public class AnchorCustomizerPlugin extends Plugin {
         flushPendingSaves(false);
     }
 
+    /**
+     * Re-assert anchored overlay positions every rendered frame. {@link BeforeRender} fires
+     * on the client thread immediately before the overlay renderer draws, so this overrides
+     * any transient position reset caused by a RuneLite relayout (e.g. toggling the
+     * inventory/spellbook/prayer tab) within the same frame — eliminating the 1-frame flash
+     * of the default snap-corner that {@link #onClientTick}'s 50 Hz cadence could not catch.
+     *
+     * Cheap by construction: it only re-applies positions already computed during the tick
+     * (no layout math, no OverlayManager scan), and {@code setPreferredLocation} is a no-op
+     * when the position already matches — which it does on every frame except the relayout
+     * one.
+     */
+    @Subscribe
+    public void onBeforeRender(BeforeRender event) {
+        reassertOverlayPositions();
+    }
+
+    private void reassertOverlayPositions() {
+        if (overlayTargets.isEmpty()) {
+            return;
+        }
+        final long now = System.currentTimeMillis();
+        for (Map.Entry<String, Point> entry : overlayTargets.entrySet()) {
+            String overlayId = entry.getKey();
+
+            // Don't fight an overlay the user is actively dragging (same guard the tick's
+            // positioning pass uses): let its cursor-driven position stand.
+            Long movedAt = lastExternalMoveTime.get(overlayId);
+            if (movedAt != null && (now - movedAt) < DRAG_DETECT_MS) {
+                continue;
+            }
+
+            Overlay overlay = trackedOverlays.get(overlayId);
+            if (overlay == null) {
+                overlay = movableOverlayByKey.get(overlayId);
+            }
+            if (overlay == null || !overlay.isMovable()) {
+                continue;
+            }
+
+            // preferredPosition is owned/normalized to null by the tick path
+            // (snapAndStackOverlays); here we only re-assert the location every frame.
+            Point target = entry.getValue();
+            Point cur = overlay.getPreferredLocation();
+            if (cur == null || cur.x != target.x || cur.y != target.y) {
+                overlay.setPreferredLocation(new Point(target));
+            }
+        }
+    }
+
     private long lastResizeTime = 0;
 
     // Map<OverlayKey, RegionId> to track which region owns an overlay (persisted)
@@ -771,6 +828,13 @@ public class AnchorCustomizerPlugin extends Plugin {
     private final Map<String, Integer> overlayOrder = new ConcurrentHashMap<>();
     // Map<OverlayKey, Overlay> to store direct references to captured overlays (runtime only)
     private final Map<String, Overlay> trackedOverlays = new ConcurrentHashMap<>();
+
+    // Last anchored target position computed for each assigned overlay during the tick's
+    // positioning pass. Re-applied every rendered frame in onBeforeRender so a RuneLite
+    // relayout (e.g. toggling the inventory tab) can't flash the overlay at its default
+    // snap-corner for the frame(s) before the next client tick (GitHub issue: 1-frame
+    // flicker). Cleared + repopulated each tick, so released overlays drop out automatically.
+    private final Map<String, Point> overlayTargets = new ConcurrentHashMap<>();
 
     /**
      * Stable identity for an overlay. Prefers {@link Overlay#getName()} (which is
@@ -819,6 +883,10 @@ public class AnchorCustomizerPlugin extends Plugin {
     private final Map<String, Overlay> movableOverlayByKey = new HashMap<>();
 
     private void snapAndStackOverlays(boolean isResizingWindowIgnored) {
+        // Rebuild the per-frame reassert cache from scratch each tick. Clearing before the
+        // empty-regions early return means that if every region was just deleted, the
+        // onBeforeRender pass stops re-positioning overlays immediately.
+        overlayTargets.clear();
         if (anchorRegions.isEmpty())
             return;
 
@@ -1105,8 +1173,19 @@ public class AnchorCustomizerPlugin extends Plugin {
                 int targetX = startX + relX;
                 int targetY = startY + relY;
 
-                if (overlay.getPreferredPosition() != OverlayPosition.DYNAMIC) {
-                    overlay.setPreferredPosition(OverlayPosition.DYNAMIC);
+                // Use a NULL preferred position (not DYNAMIC). RuneLite's
+                // OverlayManager.rebuildOverlayLayers() promotes an UNDER_WIDGETS overlay to
+                // ABOVE_WIDGETS only when preferredPosition == null && preferredLocation != null
+                // — the same promotion it applies to any overlay the user free-drags onto the
+                // screen, "so it can draw over interfaces". Forcing DYNAMIC here defeated that
+                // promotion, which is exactly why attached infoboxes rendered behind game UI.
+                // Positioning is unaffected: the renderer draws at preferredLocation whenever it
+                // is non-null, regardless of preferredPosition. saveOverlay() triggers the
+                // one-time layer rebuild so the promotion lands immediately; once the position is
+                // null it stays null and this no-ops on subsequent ticks.
+                if (overlay.getPreferredPosition() != null) {
+                    overlay.setPreferredPosition(null);
+                    overlayManager.saveOverlay(overlay);
                 }
 
                 String overlayId = overlayKey(overlay);
@@ -1122,6 +1201,11 @@ public class AnchorCustomizerPlugin extends Plugin {
                 if (currentLoc == null || currentLoc.x != targetX || currentLoc.y != targetY) {
                     overlay.setPreferredLocation(targetPoint);
                 }
+
+                // Remember this target so onBeforeRender can re-assert it every frame,
+                // closing the 1-frame gap where a RuneLite relayout would otherwise show
+                // the overlay at its default position until the next client tick.
+                overlayTargets.put(overlayId, new Point(targetX, targetY));
             }
         }
 
@@ -1428,8 +1512,10 @@ public class AnchorCustomizerPlugin extends Plugin {
                     boolean needsSeed = loc == null || !regionBounds.contains(loc);
                     if (needsSeed) {
                         overlay.setPreferredLocation(new Point(region.getX(), region.getY()));
-                        if (overlay.getPreferredPosition() != OverlayPosition.DYNAMIC) {
-                            overlay.setPreferredPosition(OverlayPosition.DYNAMIC);
+                        // Null position (not DYNAMIC) so the UNDER_WIDGETS->ABOVE_WIDGETS
+                        // promotion applies; the next snap tick's saveOverlay rebuilds layers.
+                        if (overlay.getPreferredPosition() != null) {
+                            overlay.setPreferredPosition(null);
                         }
                         log.debug("Seeded overlay {} preferredLocation to region {} origin", overlayId, assignedRegionId);
                     }
