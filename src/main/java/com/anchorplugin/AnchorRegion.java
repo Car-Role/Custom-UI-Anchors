@@ -52,4 +52,26 @@ public class AnchorRegion {
     public java.awt.Rectangle getBounds() {
         return new java.awt.Rectangle(x, y, width, height);
     }
+
+    // Deep copy with all geometry fields (live x/y/w/h and the origin snapshot)
+    // multiplied by the given factor and rounded to the nearest pixel. Used by the
+    // resolution-profile system to convert between a profile's canonical coordinate
+    // space (stored at the family's base resolution) and the live coordinate space
+    // of the current monitor. factor == 1.0 yields a plain deep copy.
+    public AnchorRegion scaledCopy(double factor) {
+        return new AnchorRegion(
+                id,
+                name,
+                (int) Math.round(x * factor),
+                (int) Math.round(y * factor),
+                (int) Math.round(width * factor),
+                (int) Math.round(height * factor),
+                constraint,
+                alignment,
+                stacking,
+                (int) Math.round(originX * factor),
+                (int) Math.round(originY * factor),
+                (int) Math.round(originW * factor),
+                (int) Math.round(originH * factor));
+    }
 }

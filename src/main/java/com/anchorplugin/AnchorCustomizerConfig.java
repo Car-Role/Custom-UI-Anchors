@@ -24,6 +24,14 @@ public interface AnchorCustomizerConfig extends Config {
     @ConfigItem(keyName = "regionJson", name = "Region Data", description = "Internal storage for region data", hidden = true)
     void setRegionJson(String json);
 
+    @ConfigItem(keyName = "regionProfiles", name = "Region Profiles", description = "Internal storage for per-resolution region layout profiles", hidden = true)
+    default String regionProfilesJson() {
+        return "{}";
+    }
+
+    @ConfigItem(keyName = "regionProfiles", name = "Region Profiles", description = "Internal storage for per-resolution region layout profiles", hidden = true)
+    void setRegionProfilesJson(String json);
+
     @ConfigItem(keyName = "overlayAssignments", name = "Overlay Assignments", description = "Internal storage for overlay assignments", hidden = true)
     default String overlayAssignmentsJson() {
         return "{}";
