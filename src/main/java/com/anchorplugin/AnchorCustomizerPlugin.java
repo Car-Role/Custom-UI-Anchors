@@ -169,6 +169,7 @@ public class AnchorCustomizerPlugin extends Plugin {
     private boolean regionsDirty = false;
     private boolean assignmentsDirty = false;
     private boolean orderDirty = false;
+    private boolean profilesDirty = false;
     private long lastFlushTime = 0L;
     private String lastWrittenRegionJson = null;
     private String lastWrittenAssignmentsJson = null;
@@ -238,6 +239,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         lastMouseY = Integer.MIN_VALUE;
         regionsDirty = false;
         assignmentsDirty = false;
+        profilesDirty = false;
         needsSnap = false;
         navButtonAdded = false;
 
@@ -485,6 +487,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorConstraint.TOP_LEFT,
                 AnchorAlignment.CENTER,
                 AnchorStacking.VERTICAL,
+                false,
                 0, 0, 0, 0);
         rebaselineOrigin(region);
 
@@ -493,6 +496,28 @@ public class AnchorCustomizerPlugin extends Plugin {
         selectAnchor(region);
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
         SwingUtilities.invokeLater(() -> panel.updateList(snap));
+    }
+
+    /**
+     * Move a region to a new index in the layer list (panel drag-and-drop reorder).
+     * Index 0 is the TOP of the layer stack: it is drawn last by the customizer
+     * overlay and picked first by the input listener. The list order is persisted via
+     * {@link #saveRegions()} (it's simply the JSON array order), so layering survives
+     * restarts and is stored per resolution profile.
+     */
+    public void moveRegionToIndex(AnchorRegion region, int targetIndex) {
+        if (region == null) return;
+        clientThread.invoke(() -> {
+            int from = anchorRegions.indexOf(region);
+            if (from < 0) return;
+            int to = Math.max(0, Math.min(targetIndex, anchorRegions.size() - 1));
+            if (from == to) return;
+            anchorRegions.remove(from);
+            anchorRegions.add(to, region);
+            saveRegions();
+            final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
+            SwingUtilities.invokeLater(() -> panel.updateList(snap));
+        });
     }
 
     public void deleteRegion(AnchorRegion region) {
@@ -757,13 +782,16 @@ public class AnchorCustomizerPlugin extends Plugin {
         config.setRegionJson(json);
 
         // Authoritative per-profile storage: fold the live layout back into the active
-        // profile's canonical (base-resolution) space and persist the whole map.
+        // profile's canonical (base-resolution) space. The actual config write is
+        // DEBOUNCED via flushPendingSaves — saveRegions runs every tick during a window
+        // resize, and serializing the whole profile map + firing a second ConfigChanged
+        // through the event bus at 50 Hz was measurably costing frame time. The in-memory
+        // map is always current; only the persistence is deferred (and force-flushed on
+        // shutDown / profile switches).
         if (activeProfileKey != null) {
             profileLayouts.put(activeProfileKey, toCanonical(snapshot, activeProfileFactor));
         }
-        String profilesJson = gson.toJson(profileLayouts);
-        lastWrittenProfilesJson = profilesJson;
-        config.setRegionProfilesJson(profilesJson);
+        profilesDirty = true;
         regionsDirty = false;
     }
 
@@ -931,6 +959,9 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         log.debug("Switched layout profile {} -> {} (factor {}, seeded={})", fromKey, match.key, match.factor, seeded);
         saveRegions();
+        // Profile swaps are rare and important — persist immediately rather than waiting
+        // for the debounced flush.
+        flushPendingSaves(true);
         requestSnap();
 
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
@@ -996,6 +1027,12 @@ public class AnchorCustomizerPlugin extends Plugin {
             config.setOverlayOrderJson(json);
             orderDirty = false;
         }
+        if (profilesDirty) {
+            String json = gson.toJson(profileLayouts);
+            lastWrittenProfilesJson = json;
+            config.setRegionProfilesJson(json);
+            profilesDirty = false;
+        }
         lastFlushTime = now;
     }
 
@@ -1023,6 +1060,22 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     @Subscribe
     public void onClientTick(ClientTick event) {
+        // Diagnostic instrumentation: client ticks run at ~50 Hz, so anything over a
+        // few ms here is eating frame budget. Logged at debug so it shows up in
+        // client.log (debug is enabled there) without spamming normal users' consoles.
+        final long tickStartNanos = System.nanoTime();
+        try {
+            tickInternal();
+        } finally {
+            long elapsedMs = (System.nanoTime() - tickStartNanos) / 1_000_000L;
+            if (elapsedMs >= 5) {
+                log.debug("Slow anchor tick: {} ms (regions={}, tracked={}, assignments={})",
+                        elapsedMs, anchorRegions.size(), trackedOverlays.size(), overlayAssignments.size());
+            }
+        }
+    }
+
+    private void tickInternal() {
         boolean isResizingWindow = false;
 
         // Handle Window Resize Constraints — derivation model.
@@ -1250,11 +1303,23 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Snapshot regions once per call (defensive against EDT/panel edits)
         final List<AnchorRegion> regionsSnapshot = new ArrayList<>(anchorRegions);
 
-        // Periodically re-acquire overlays that may have registered after startup
+        // Periodically re-acquire overlays that registered after startup.
+        //
+        // The old gate (assignments.size() > tracked.size()) never converges when an
+        // assignment key is permanently unresolvable — e.g. plugins like
+        // TimeTrackingReminder whose overlay NAME embeds a per-session timestamp
+        // (..._1780500862051), so the persisted key never matches a live overlay again.
+        // The result was the full overlayManager.anyMatch scan firing every second for
+        // the entire session, accomplishing nothing (observed in client.log).
+        //
+        // New gate: only rescan when some unresolved assignment's key is ACTUALLY PRESENT
+        // in the overlay manager right now (movableOverlayByKey, rebuilt every tick by the
+        // fused walk). A stale timestamp key is never present → never triggers a scan; a
+        // legitimately late-registering overlay shows up in the map and is re-acquired
+        // within a tick. The present-key check short-circuits behind the interval gate so
+        // it only runs ~1 Hz.
         long nowMs = System.currentTimeMillis();
-        if (!overlayAssignments.isEmpty()
-                && overlayAssignments.size() > trackedOverlays.size()
-                && (nowMs - lastReacquireTime) >= REACQUIRE_INTERVAL_MS) {
+        if ((nowMs - lastReacquireTime) >= REACQUIRE_INTERVAL_MS && hasReacquirableAssignment()) {
             scanAndReacquireOverlays();
             lastReacquireTime = nowMs;
         }
@@ -1374,6 +1439,23 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Process buckets (Positioning logic)
         for (AnchorRegion region : regionsSnapshot) {
             List<Overlay> overlays = buckets.get(region.getId());
+
+            // Ghost-space fix: an overlay that is registered but currently rendering
+            // nothing (plugin condition hides it, infobox group empty, owning plugin
+            // half-disabled) has empty live bounds — the renderer zeroes them on
+            // non-rendering frames. Previously these fell through to the phantom
+            // 100x24 fallback size below and the stack reserved invisible space for
+            // them indefinitely. Drop them from the layout instead; their assignment
+            // AND their persisted overlayOrder index are deliberately retained, so
+            // the moment they render again they reclaim their original slot and
+            // neighbors reflow around them. Mid-drag overlays are exempt (their
+            // bounds can be briefly empty before first render during capture).
+            overlays.removeIf(o -> {
+                if (!o.getBounds().isEmpty()) return false;
+                String id = overlayKey(o);
+                return id == null || !draggingIds.contains(id);
+            });
+
             if (overlays.isEmpty())
                 continue;
 
@@ -1833,6 +1915,25 @@ public class AnchorCustomizerPlugin extends Plugin {
      * Without this seed, the snap loop's {@code if (preferredLocation == null) continue} guard
      * would leave the overlay stranded and its assignment would appear inert.
      */
+    /**
+     * True when at least one persisted assignment refers to an overlay that is currently
+     * present in the overlay manager (per the most recent {@link #runFusedOverlayWalk()})
+     * but not yet tracked — i.e. a rescan would actually re-acquire something. Gates the
+     * periodic {@link #scanAndReacquireOverlays()} so it can't loop fruitlessly every
+     * second for assignment keys that can never resolve (timestamp-suffixed overlay names).
+     */
+    private boolean hasReacquirableAssignment() {
+        if (overlayAssignments.isEmpty()) {
+            return false;
+        }
+        for (String key : overlayAssignments.keySet()) {
+            if (!trackedOverlays.containsKey(key) && movableOverlayByKey.containsKey(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void scanAndReacquireOverlays() {
         if (overlayAssignments.isEmpty()) {
             return;

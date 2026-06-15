@@ -12,7 +12,6 @@ import java.awt.Rectangle;
 import java.util.List;
 import javax.inject.Inject;
 import net.runelite.api.Client;
-import net.runelite.api.Point;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -64,14 +63,23 @@ public class AnchorCustomizerOverlay extends Overlay {
         }
 
         net.runelite.api.Point mouseCanvasPos = client.getMouseCanvasPosition();
-        Point mousePosition = new Point(mouseCanvasPos.getX(), mouseCanvasPos.getY());
+        java.awt.Point mouseAwt = new java.awt.Point(mouseCanvasPos.getX(), mouseCanvasPos.getY());
 
         boolean isAltDown = client.isKeyPressed(KeyCode.KC_ALT);
 
         List<AnchorRegion> regions = plugin.getAnchorRegions();
-        for (AnchorRegion region : regions) {
+
+        // Hover visuals follow the pick path: only the region a click would actually hit
+        // (topmost unlocked under the cursor) lights up — overlapped regions beneath it
+        // and locked regions stay at their resting style. Reuses this frame's snapshot.
+        AnchorRegion hoverTarget = inputListener != null ? inputListener.pickTopAnchorAt(mouseAwt, regions) : null;
+
+        // Draw in REVERSE list order so the panel list reads top-down as the layer
+        // stack: index 0 is drawn last and therefore renders on top of everything else.
+        for (int i = regions.size() - 1; i >= 0; i--) {
+            AnchorRegion region = regions.get(i);
             boolean isDraggingThis = draggingAnchor != null && draggingAnchor.getId() == region.getId();
-            boolean isHovering = region.getBounds().contains(mousePosition.getX(), mousePosition.getY());
+            boolean isHovering = hoverTarget != null && hoverTarget.getId() == region.getId();
 
             drawAnchorRegion(graphics, region, isDraggingThis, isHovering, isAltDown);
         }
@@ -81,9 +89,13 @@ public class AnchorCustomizerOverlay extends Overlay {
 
     private void drawAnchorRegion(Graphics2D graphics, AnchorRegion region, boolean isDragging, boolean isHovering,
             boolean isAltDown) {
+        // Locked regions are click-through (never the hover/pick target, never dragged),
+        // so they always render at the resting style plus a lock glyph under the label.
+        boolean locked = region.isLocked();
+
         // Only show yellow highlight if dragging OR (hovering AND Alt is held)
         // If just hovering without Alt, show standard border (Cyan)
-        boolean showHighlight = isDragging || (isHovering && isAltDown);
+        boolean showHighlight = !locked && (isDragging || (isHovering && isAltDown));
 
         Color borderColor = showHighlight ? (isDragging ? ANCHOR_DRAGGING_COLOR : Color.YELLOW) : ANCHOR_BORDER_COLOR;
         Color fillColor = isDragging ? ANCHOR_DRAGGING_FILL_COLOR : ANCHOR_FILL_COLOR;
@@ -107,11 +119,35 @@ public class AnchorCustomizerOverlay extends Overlay {
         graphics.setColor(Color.WHITE);
         graphics.drawString(label, textX, textY);
 
+        // Lock glyph centered below the label, in the same color as the anchor border.
+        if (locked) {
+            drawLockIcon(graphics, bounds.x + bounds.width / 2, textY + 5, borderColor);
+        }
+
         // Draw resize handles if hovering or dragging
         // Draw resize handles if (hovering AND Alt is held) or dragging
-        if ((isHovering && isAltDown) || isDragging) {
+        if (!locked && ((isHovering && isAltDown) || isDragging)) {
             drawResizeHandles(graphics, bounds);
         }
+    }
+
+    /**
+     * Tiny padlock: an arc shackle over a filled body, centered horizontally on
+     * {@code cx} with the shackle's top at {@code topY}.
+     */
+    private void drawLockIcon(Graphics2D graphics, int cx, int topY, Color color) {
+        // bodyW is odd so fillRect(cx - bodyW/2, ..) spans symmetrically around cx —
+        // at 8 wide the body sat 1px short on the right relative to the shackle.
+        final int bodyW = 9;
+        final int bodyH = 6;
+        final int shackleW = 6;
+        final int shackleH = 6;
+
+        graphics.setColor(color);
+        // Shackle (upper half-circle), overlapping the body slightly so they connect.
+        graphics.drawArc(cx - shackleW / 2, topY, shackleW, shackleH, 0, 180);
+        // Body
+        graphics.fillRect(cx - bodyW / 2, topY + shackleH / 2 + 1, bodyW, bodyH);
     }
 
     private void drawResizeHandles(Graphics2D graphics, Rectangle bounds) {

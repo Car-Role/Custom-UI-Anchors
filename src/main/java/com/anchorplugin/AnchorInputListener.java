@@ -220,21 +220,53 @@ public class AnchorInputListener implements MouseListener {
 
     /**
      * Collect every anchor region whose bounds (or resize handle zone) contain {@code p},
-     * ordered from topmost to bottommost. "Topmost" matches {@link AnchorCustomizerOverlay}'s
-     * drawing order: the last element in {@code plugin.getAnchorRegions()} is drawn last
-     * and therefore appears on top, so we iterate the list in reverse.
+     * ordered from topmost to bottommost. Layering follows the panel list order: index 0
+     * is the TOP of the stack ({@link AnchorCustomizerOverlay} draws the list in reverse
+     * so the first element renders last / on top), so we iterate the list forward.
+     *
+     * Locked regions are excluded entirely — they are click-through for anchor picking,
+     * so hovering or clicking over a locked anchor falls through to whatever unlocked
+     * anchor sits beneath (or to the game if there is none).
      */
     private List<AnchorRegion> pickAnchorsAt(Point p) {
-        List<AnchorRegion> regions = plugin.getAnchorRegions();
         List<AnchorRegion> hits = new ArrayList<>();
-        for (int i = regions.size() - 1; i >= 0; i--) {
-            AnchorRegion r = regions.get(i);
+        for (AnchorRegion r : plugin.getAnchorRegions()) {
+            if (r.isLocked()) {
+                continue;
+            }
             Rectangle b = r.getBounds();
             if (b.contains(p) || isNearResizeHandle(b, p)) {
                 hits.add(r);
             }
         }
         return hits;
+    }
+
+    /**
+     * The anchor the user would interact with at {@code p}: the topmost unlocked region
+     * under the point, or null. Used by {@link AnchorCustomizerOverlay} so hover visuals
+     * (highlight + resize handles) light up only the region a click would actually hit.
+     */
+    public AnchorRegion pickTopAnchorAt(Point p) {
+        return pickTopAnchorAt(p, plugin.getAnchorRegions());
+    }
+
+    /**
+     * Snapshot-reusing variant for per-frame callers (the customizer overlay already
+     * holds a region snapshot for drawing; re-snapshotting here every frame would just
+     * double the allocations).
+     */
+    public AnchorRegion pickTopAnchorAt(Point p, List<AnchorRegion> regions) {
+        for (AnchorRegion r : regions) {
+            if (r.isLocked()) {
+                continue;
+            }
+            Rectangle b = r.getBounds();
+            if (b.contains(p) || isNearResizeHandle(b, p)) {
+                return r;
+            }
+        }
+        return null;
     }
 
     /**
@@ -278,14 +310,14 @@ public class AnchorInputListener implements MouseListener {
             return e;
         }
 
-        // Update cursor based on hover
-        for (AnchorRegion region : plugin.getAnchorRegions()) {
-            Rectangle bounds = region.getBounds();
-            if (bounds.contains(e.getPoint()) || isNearResizeHandle(bounds, e.getPoint())) {
-                int dir = getResizeDirection(bounds, e.getPoint());
-                canvas.setCursor(getCursorForDirection(dir));
-                return e;
-            }
+        // Update cursor based on hover. Use the pick path so the cursor reflects the
+        // region a click would actually hit: topmost unlocked first, locked regions
+        // click-through (no move/resize cursor over them).
+        AnchorRegion hover = pickTopAnchorAt(e.getPoint());
+        if (hover != null) {
+            int dir = getResizeDirection(hover.getBounds(), e.getPoint());
+            canvas.setCursor(getCursorForDirection(dir));
+            return e;
         }
 
         // Reset cursor if not colliding with any region

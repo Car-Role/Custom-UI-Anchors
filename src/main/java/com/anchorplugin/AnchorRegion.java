@@ -27,6 +27,15 @@ public class AnchorRegion {
     private AnchorAlignment alignment = AnchorAlignment.CENTER; // Default to Center
     private AnchorStacking stacking = AnchorStacking.VERTICAL; // Default to Vertical
 
+    // When true, the anchor cannot be moved or resized on the canvas and is fully
+    // click-through for anchor picking (clicks fall through to anchors layered
+    // beneath). Panel edits (X/Y/W/H spinners etc.) still work as an escape hatch.
+    // Volatile: written from the EDT (panel checkbox via clientThread.invoke lands on
+    // the client thread, but reads happen on the AWT mouse thread in the input
+    // listener) — same visibility rationale as x/y above. Defaults to false, which
+    // Gson also yields for legacy persisted data missing the field.
+    private volatile boolean locked = false;
+
     // Origin snapshot used by the constraint-derivation tick loop. Captured at the
     // most recent user edit (drag end, edge-resize end, panel field commit, region
     // create). Each tick the live (x, y) is recomputed deterministically from
@@ -69,6 +78,7 @@ public class AnchorRegion {
                 constraint,
                 alignment,
                 stacking,
+                locked,
                 (int) Math.round(originX * factor),
                 (int) Math.round(originY * factor),
                 (int) Math.round(originW * factor),

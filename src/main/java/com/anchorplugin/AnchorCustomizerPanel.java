@@ -12,10 +12,14 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.util.List;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.Transferable;
 import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
+import javax.swing.DropMode;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
@@ -24,6 +28,7 @@ import javax.swing.JSpinner;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
 import javax.swing.SpinnerNumberModel;
+import javax.swing.TransferHandler;
 import javax.swing.border.EmptyBorder;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
@@ -43,6 +48,9 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final ArrowGridPicker<AnchorConstraint> constraintPicker;
     private final ArrowGridPicker<AnchorAlignment> alignmentPicker;
     private final JComboBox<AnchorStacking> stackingComboBox;
+
+    // Width of the clickable padlock zone at the right edge of each list row.
+    private static final int LOCK_ZONE_WIDTH = 28;
 
     private AnchorRegion selectedRegion;
     private boolean isUpdating = false;
@@ -71,6 +79,41 @@ public class AnchorCustomizerPanel extends PluginPanel {
         regionList.setCellRenderer(new AnchorRegionListRenderer());
         regionList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         regionList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        regionList.setToolTipText(
+                "Drag entries to reorder layering: the top of the list renders above lower entries, "
+                        + "and overlapping anchors are picked top-first on the canvas. New anchors are added at the bottom. "
+                        + "Click the padlock to lock/unlock an anchor (locked anchors can't be moved or resized on the canvas).");
+
+        // Click-to-toggle lock: a click landing in the padlock zone at the right edge of
+        // a row flips that anchor's lock. Uses mouseClicked (press+release without
+        // movement) so starting a reorder drag from the icon doesn't also toggle it.
+        regionList.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
+                int idx = regionList.locationToIndex(e.getPoint());
+                if (idx < 0 || idx >= listModel.size()) {
+                    return;
+                }
+                java.awt.Rectangle cell = regionList.getCellBounds(idx, idx);
+                if (cell == null || !cell.contains(e.getPoint())) {
+                    return;
+                }
+                if (e.getPoint().x >= cell.x + cell.width - LOCK_ZONE_WIDTH) {
+                    AnchorRegion region = listModel.get(idx);
+                    // Immediate EDT write for instant visual feedback (volatile boolean,
+                    // no geometry/list mutation involved), then persist via the client
+                    // thread. No origin rebaseline needed — geometry is untouched.
+                    region.setLocked(!region.isLocked());
+                    plugin.saveRegionsFromAnyThread();
+                    regionList.repaint();
+                }
+            }
+        });
+
+        // Drag-and-drop reordering: list order IS the layer stack (index 0 = topmost).
+        regionList.setDragEnabled(true);
+        regionList.setDropMode(DropMode.INSERT);
+        regionList.setTransferHandler(new ListReorderHandler());
 
         regionList.addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting() && !isUpdating) {
@@ -383,25 +426,153 @@ public class AnchorCustomizerPanel extends PluginPanel {
         }
     }
 
-    private static class AnchorRegionListRenderer extends JLabel implements javax.swing.ListCellRenderer<AnchorRegion> {
+    /**
+     * Drag-and-drop reordering for the region list. The list order is the layer stack
+     * (index 0 = topmost on canvas), so a reorder here is routed to
+     * {@link AnchorCustomizerPlugin#moveRegionToIndex} which mutates the authoritative
+     * region list on the client thread, persists it, and refreshes this panel.
+     */
+    private class ListReorderHandler extends TransferHandler {
+        private final DataFlavor flavor = new DataFlavor(Integer.class, "RegionListIndex");
+        private int fromIndex = -1;
+
+        @Override
+        protected Transferable createTransferable(JComponent c) {
+            fromIndex = regionList.getSelectedIndex();
+            if (fromIndex < 0) {
+                return null;
+            }
+            return new Transferable() {
+                @Override
+                public DataFlavor[] getTransferDataFlavors() {
+                    return new DataFlavor[] { flavor };
+                }
+
+                @Override
+                public boolean isDataFlavorSupported(DataFlavor f) {
+                    return flavor.equals(f);
+                }
+
+                @Override
+                public Object getTransferData(DataFlavor f) {
+                    return fromIndex;
+                }
+            };
+        }
+
+        @Override
+        public int getSourceActions(JComponent c) {
+            return MOVE;
+        }
+
+        @Override
+        public boolean canImport(TransferSupport support) {
+            return support.isDrop() && support.isDataFlavorSupported(flavor);
+        }
+
+        @Override
+        public boolean importData(TransferSupport support) {
+            if (!canImport(support) || fromIndex < 0 || fromIndex >= listModel.size()) {
+                return false;
+            }
+            JList.DropLocation dl = (JList.DropLocation) support.getDropLocation();
+            int dropIndex = dl.getIndex();
+            if (dropIndex < 0) {
+                return false;
+            }
+            // INSERT drop mode gives the gap index; account for the removal of the
+            // dragged element when it sits above the drop gap.
+            int target = dropIndex > fromIndex ? dropIndex - 1 : dropIndex;
+            if (target == fromIndex) {
+                return true;
+            }
+            plugin.moveRegionToIndex(listModel.get(fromIndex), target);
+            return true;
+        }
+    }
+
+    private static class AnchorRegionListRenderer extends JPanel implements javax.swing.ListCellRenderer<AnchorRegion> {
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel lockLabel = new JLabel();
+
         public AnchorRegionListRenderer() {
+            super(new BorderLayout());
             setOpaque(true);
-            setBorder(new EmptyBorder(5, 10, 5, 10));
+            setBorder(new EmptyBorder(5, 10, 5, 6));
+            nameLabel.setOpaque(false);
+            lockLabel.setOpaque(false);
+            lockLabel.setHorizontalAlignment(JLabel.CENTER);
+            lockLabel.setPreferredSize(new Dimension(LOCK_ZONE_WIDTH - 6, 16));
+            add(nameLabel, BorderLayout.CENTER);
+            add(lockLabel, BorderLayout.EAST);
         }
 
         @Override
         public java.awt.Component getListCellRendererComponent(JList<? extends AnchorRegion> list, AnchorRegion value,
                 int index, boolean isSelected, boolean cellHasFocus) {
-            setText(value.getName() + " (ID: " + value.getId() + ")");
+            nameLabel.setText(value.getName() + " (ID: " + value.getId() + ")");
 
-            if (isSelected) {
-                setBackground(ColorScheme.BRAND_ORANGE);
-                setForeground(Color.BLACK);
-            } else {
-                setBackground(ColorScheme.DARKER_GRAY_COLOR);
-                setForeground(Color.WHITE);
-            }
+            Color fg = isSelected ? Color.BLACK : Color.WHITE;
+            setBackground(isSelected ? ColorScheme.BRAND_ORANGE : ColorScheme.DARKER_GRAY_COLOR);
+            nameLabel.setForeground(fg);
+
+            // Locked: solid icon in the row's foreground color. Unlocked: dimmed open
+            // padlock so the toggle is discoverable without shouting.
+            Color iconColor = value.isLocked()
+                    ? fg
+                    : (isSelected ? new Color(0, 0, 0, 110) : ColorScheme.MEDIUM_GRAY_COLOR);
+            lockLabel.setIcon(new LockToggleIcon(value.isLocked(), iconColor));
             return this;
+        }
+    }
+
+    /**
+     * Painted padlock for the list rows: closed shackle when locked, shackle swung
+     * open to the right when unlocked.
+     */
+    private static class LockToggleIcon implements javax.swing.Icon {
+        private final boolean closed;
+        private final Color color;
+
+        LockToggleIcon(boolean closed, Color color) {
+            this.closed = closed;
+            this.color = color;
+        }
+
+        @Override
+        public void paintIcon(java.awt.Component c, java.awt.Graphics g, int x, int y) {
+            java.awt.Graphics2D g2 = (java.awt.Graphics2D) g.create();
+            g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+                    java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(color);
+            g2.setStroke(new java.awt.BasicStroke(1.6f));
+
+            final int bodyW = 9;
+            final int bodyH = 7;
+            final int shackleW = 6;
+            final int shackleH = 8;
+            int cx = x + getIconWidth() / 2;
+            int bodyY = y + 6;
+
+            if (closed) {
+                // Shackle centered over the body.
+                g2.drawArc(cx - shackleW / 2, y + 1, shackleW, shackleH, 0, 180);
+            } else {
+                // Shackle swung open: anchored near the body's right edge, arcing away.
+                g2.drawArc(cx - shackleW / 2 + 5, y, shackleW, shackleH, 0, 180);
+            }
+            g2.fillRect(cx - bodyW / 2, bodyY, bodyW, bodyH);
+            g2.dispose();
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 18;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 16;
         }
     }
 }
