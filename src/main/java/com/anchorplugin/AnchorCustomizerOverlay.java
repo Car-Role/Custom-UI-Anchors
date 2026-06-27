@@ -15,7 +15,6 @@ import net.runelite.api.Client;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.api.KeyCode;
 
 public class AnchorCustomizerOverlay extends Overlay {
     // Colors
@@ -65,7 +64,10 @@ public class AnchorCustomizerOverlay extends Overlay {
         net.runelite.api.Point mouseCanvasPos = client.getMouseCanvasPosition();
         java.awt.Point mouseAwt = new java.awt.Point(mouseCanvasPos.getX(), mouseCanvasPos.getY());
 
-        boolean isAltDown = client.isKeyPressed(KeyCode.KC_ALT);
+        // Highlights/resize handles light up for the user's configured drag hotkey (not a
+        // hardcoded Alt), so they match whatever key actually edits — e.g. if the drag hotkey
+        // is "g", g shows the anchors. Mirrors the drag detection in AnchorInputListener.
+        boolean editActive = plugin.isDragHotkeyActive();
 
         List<AnchorRegion> regions = plugin.getAnchorRegions();
 
@@ -81,21 +83,21 @@ public class AnchorCustomizerOverlay extends Overlay {
             boolean isDraggingThis = draggingAnchor != null && draggingAnchor.getId() == region.getId();
             boolean isHovering = hoverTarget != null && hoverTarget.getId() == region.getId();
 
-            drawAnchorRegion(graphics, region, isDraggingThis, isHovering, isAltDown);
+            drawAnchorRegion(graphics, region, isDraggingThis, isHovering, editActive);
         }
 
         return null;
     }
 
     private void drawAnchorRegion(Graphics2D graphics, AnchorRegion region, boolean isDragging, boolean isHovering,
-            boolean isAltDown) {
+            boolean editActive) {
         // Locked regions are click-through (never the hover/pick target, never dragged),
         // so they always render at the resting style plus a lock glyph under the label.
         boolean locked = region.isLocked();
 
-        // Only show yellow highlight if dragging OR (hovering AND Alt is held)
-        // If just hovering without Alt, show standard border (Cyan)
-        boolean showHighlight = !locked && (isDragging || (isHovering && isAltDown));
+        // Only show yellow highlight if dragging OR (hovering AND the edit hotkey is held).
+        // If just hovering without the hotkey, show standard border (Cyan).
+        boolean showHighlight = !locked && (isDragging || (isHovering && editActive));
 
         Color borderColor = showHighlight ? (isDragging ? ANCHOR_DRAGGING_COLOR : Color.YELLOW) : ANCHOR_BORDER_COLOR;
         Color fillColor = isDragging ? ANCHOR_DRAGGING_FILL_COLOR : ANCHOR_FILL_COLOR;
@@ -124,9 +126,8 @@ public class AnchorCustomizerOverlay extends Overlay {
             drawLockIcon(graphics, bounds.x + bounds.width / 2, textY + 5, borderColor);
         }
 
-        // Draw resize handles if hovering or dragging
-        // Draw resize handles if (hovering AND Alt is held) or dragging
-        if (!locked && ((isHovering && isAltDown) || isDragging)) {
+        // Draw resize handles if (hovering AND the edit hotkey is held) or dragging.
+        if (!locked && ((isHovering && editActive) || isDragging)) {
             drawResizeHandles(graphics, bounds);
         }
     }

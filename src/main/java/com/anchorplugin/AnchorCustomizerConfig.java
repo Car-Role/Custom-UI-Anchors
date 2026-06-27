@@ -7,6 +7,8 @@ package com.anchorplugin;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
+import net.runelite.client.config.Units;
 
 @ConfigGroup("anchorcustomizer")
 public interface AnchorCustomizerConfig extends Config {
@@ -14,6 +16,18 @@ public interface AnchorCustomizerConfig extends Config {
     @ConfigItem(keyName = "showSidebarButton", name = "Show sidebar button", description = "Show the Custom UI Anchors button in the RuneLite sidebar. Turn this off to hide it once your anchors are set up.", position = 1)
     default boolean showSidebarButton() {
         return true;
+    }
+
+    @Range(min = 0, max = 20)
+    @Units(Units.PIXELS)
+    @ConfigItem(keyName = "stackSpacing", name = "Stack spacing", description = "Gap inserted between multiple overlays stacked inside the same anchor region. Set to 0 to pack them flush together.", position = 3)
+    default int stackSpacing() {
+        return 2;
+    }
+
+    @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "Log diagnostic details to the RuneLite client logs when you Alt+click an anchor. Only enable this if you're reproducing a drag/resize problem (e.g. with 117 HD) and sharing logs.", position = 2)
+    default boolean debugLogging() {
+        return false;
     }
 
     @ConfigItem(keyName = "regionJson", name = "Region Data", description = "Internal storage for region data", hidden = true)

@@ -56,7 +56,6 @@ import net.runelite.client.util.ImageUtil;
 @PluginDescriptor(name = "Custom UI Anchors", description = "Visualize and customize overlay anchor positions. Alt+drag to move anchor points.", tags = {
         "overlay", "anchor", "position", "customization", "ui" })
 public class AnchorCustomizerPlugin extends Plugin {
-    private static final int PADDING = 2;
 
     @Inject
     private Client client;
@@ -179,6 +178,10 @@ public class AnchorCustomizerPlugin extends Plugin {
     private long lastReacquireTime = 0L;
     private static final long REACQUIRE_INTERVAL_MS = 1000L;
 
+    // Throttle for the opt-in "why isn't this overlay following its anchor" diagnostic dump.
+    private long lastFollowLogTime = 0L;
+    private static final long FOLLOW_LOG_INTERVAL_MS = 1000L;
+
     // Fused overlay walk (cleanup + auto-track) throttle. Runs when the mouse or any
     // tracked overlay moves, or at least once per interval as a safety net so new
     // overlays that register mid-session are still picked up.
@@ -202,6 +205,26 @@ public class AnchorCustomizerPlugin extends Plugin {
      */
     public boolean isDragKeyHeld() {
         return anchorKeyListener != null && anchorKeyListener.isHeld();
+    }
+
+    /**
+     * Event-aware variant of {@link #isDragKeyHeld()} for the mouse listeners: resolves the
+     * drag hotkey from the client's live key state and the AWT event's own modifiers rather
+     * than the tracked flag, so anchor drag/resize keeps working even when the tracked flag
+     * desyncs (e.g. focus blips around the 117 HD canvas, or a non-modifier hotkey whose
+     * KEY_PRESSED is consumed before our listener sees it). See {@link AnchorKeyListener#isHotkeyDownLive}.
+     */
+    public boolean isDragHotkeyActive(java.awt.event.MouseEvent e) {
+        return anchorKeyListener != null && anchorKeyListener.isHotkeyDownLive(e);
+    }
+
+    /**
+     * No-event variant of {@link #isDragHotkeyActive(java.awt.event.MouseEvent)} for the overlay
+     * render pass (which has no MouseEvent). Lets the anchor highlight follow the user's configured
+     * drag hotkey instead of a hardcoded Alt, so it lights up for whatever key actually edits.
+     */
+    public boolean isDragHotkeyActive() {
+        return anchorKeyListener != null && anchorKeyListener.isHotkeyDownLive();
     }
 
     public boolean isAnchorBeingDragged() {
@@ -299,6 +322,16 @@ public class AnchorCustomizerPlugin extends Plugin {
             inputListener.resetCursorToDefault();
         });
         keyManager.registerKeyListener(anchorKeyListener);
+        // One-time heal for in-place upgrades: older builds set an explicit cursor directly
+        // on the game canvas, which overrode the Custom Cursor plugin's cursor (set on the
+        // parent container) whenever the mouse was over the canvas, and was never cleared —
+        // stranding users on the Windows default until a full client restart. Clearing the
+        // canvas cursor restores inheritance from the container; all cursor changes now go
+        // through ClientUI (AnchorInputListener), which never touches the canvas again.
+        java.awt.Canvas startupCanvas = client.getCanvas();
+        if (startupCanvas != null) {
+            startupCanvas.setCursor(null);
+        }
         // loadRegions materializes the legacy "last live layout" snapshot so the panel
         // and login-screen overlays behave exactly as before. The first logged-in tick
         // resolves the actual layout profile (fixed mode / monitor family) and swaps in
@@ -1220,12 +1253,76 @@ public class AnchorCustomizerPlugin extends Plugin {
 
             // preferredPosition is owned/normalized to null by the tick path
             // (snapAndStackOverlays); here we only re-assert the location every frame.
-            Point target = entry.getValue();
-            Point cur = overlay.getPreferredLocation();
-            if (cur == null || cur.x != target.x || cur.y != target.y) {
-                overlay.setPreferredLocation(new Point(target));
-            }
+            // entry.getValue() is the absolute canvas target; setAbsoluteLocation converts it to
+            // the overlay's (RuneLite 1.12.31+) origin-relative preferredLocation and no-ops when
+            // the overlay is already rendering on target.
+            setAbsoluteLocation(overlay, entry.getValue());
         }
+    }
+
+    /**
+     * The overlay's true top-left in ABSOLUTE canvas coordinates.
+     *
+     * RuneLite 1.12.31 ("configurable overlay origins") made {@link Overlay#getPreferredLocation()}
+     * origin-relative — it can be measured from the right/bottom/centre edge of the canvas, or
+     * relative to a widget — so it is no longer a usable absolute point. {@link Overlay#getBounds()}
+     * is the rectangle the renderer actually drew (resolved via OverlayManager.computeAbsolutePosition),
+     * i.e. already origin-resolved and absolute, so we treat it as the source of truth. Falls back to
+     * the raw preferredLocation only before the overlay has rendered (empty bounds), where nothing
+     * better is available.
+     */
+    static Point absoluteTopLeftOf(Overlay overlay) {
+        Rectangle b = overlay.getBounds();
+        if (b != null && !b.isEmpty()) {
+            return new Point(b.x, b.y);
+        }
+        Point pref = overlay.getPreferredLocation();
+        return pref != null ? new Point(pref) : null;
+    }
+
+    /**
+     * Set an overlay's preferred location to an absolute canvas point (idempotent).
+     *
+     * RuneLite 1.12.31 ("configurable overlay origins") made {@link Overlay#getPreferredLocation()}
+     * origin-relative, but {@link #normalizeOrigin} forces every overlay we manage back to a LEFT/TOP
+     * origin (via {@link net.runelite.client.ui.overlay.OverlayManager#resetOverlay}), so for our
+     * overlays preferredLocation is plain absolute again. Writing the absolute value directly is
+     * idempotent and clamp-safe: when the target sits near a screen edge RuneLite clamps the RENDERED
+     * position, but the stored value stays put (it never accumulates), so the overlay rests against
+     * the clamp instead of drifting. (An earlier delta-based "closed loop" accumulated against the
+     * clamped getBounds() and made overlays jiggle off their anchors — do not reintroduce it.)
+     */
+    static void setAbsoluteLocation(Overlay overlay, Point absoluteTopLeft) {
+        Point cur = overlay.getPreferredLocation();
+        if (cur == null || cur.x != absoluteTopLeft.x || cur.y != absoluteTopLeft.y) {
+            overlay.setPreferredLocation(new Point(absoluteTopLeft));
+        }
+    }
+
+    /**
+     * Force a managed overlay back to an absolute (LEFT/TOP) origin so {@link #setAbsoluteLocation}
+     * behaves, exactly once per capture/settle.
+     *
+     * RuneLite 1.12.31 auto-assigns RIGHT/CENTRE/BOTTOM origins when the user free-drags an overlay
+     * (OverlayRenderer.mouseDragged), which makes preferredLocation origin-relative and sends our
+     * absolute writes off-screen. The package-private origin setters are unreachable, but the public
+     * {@link net.runelite.client.ui.overlay.OverlayManager#resetOverlay} resets origin to
+     * AUTO/LEFT/TOP. Origins only change during a user drag, so a single reset after the overlay
+     * settles sticks; {@link #runFusedOverlayWalk} re-arms this (removes the id from
+     * {@link #originNormalized}) when it sees the overlay move again. resetOverlay also nulls
+     * preferredLocation/Size/Position — the caller re-sets the location immediately, and we preserve
+     * any user-set size here. Client-thread only (resetOverlay persists + rebuilds overlay layers).
+     */
+    private void normalizeOrigin(Overlay overlay, String overlayId) {
+        if (overlayId == null || originNormalized.contains(overlayId)) {
+            return;
+        }
+        Dimension savedSize = overlay.getPreferredSize();
+        overlayManager.resetOverlay(overlay);
+        if (savedSize != null) {
+            overlay.setPreferredSize(savedSize);
+        }
+        originNormalized.add(overlayId);
     }
 
     private long lastResizeTime = 0;
@@ -1238,6 +1335,11 @@ public class AnchorCustomizerPlugin extends Plugin {
     private final Map<String, Integer> overlayOrder = new ConcurrentHashMap<>();
     // Map<OverlayKey, Overlay> to store direct references to captured overlays (runtime only)
     private final Map<String, Overlay> trackedOverlays = new ConcurrentHashMap<>();
+
+    // Overlays whose origin we've normalized to LEFT/TOP (RuneLite 1.12.31 configurable origins).
+    // Reset once per capture; re-armed (id removed) when the user drags the overlay again, so a fresh
+    // RIGHT/CENTRE/BOTTOM origin from that drag gets neutralized on the next settle. See normalizeOrigin.
+    private final Set<String> originNormalized = ConcurrentHashMap.newKeySet();
 
     // Last anchored target position computed for each assigned overlay during the tick's
     // positioning pass. Re-applied every rendered frame in onBeforeRender so a RuneLite
@@ -1299,6 +1401,10 @@ public class AnchorCustomizerPlugin extends Plugin {
         overlayTargets.clear();
         if (anchorRegions.isEmpty())
             return;
+
+        // Inter-overlay gap when stacking multiple overlays in one region. User-configurable
+        // (default 2px, the long-standing hardcoded value); set to 0 to pack overlays flush.
+        final int PADDING = config.stackSpacing();
 
         // Snapshot regions once per call (defensive against EDT/panel edits)
         final List<AnchorRegion> regionsSnapshot = new ArrayList<>(anchorRegions);
@@ -1410,6 +1516,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                     // Commit the release.
                     if (overlayAssignments.containsKey(overlayId)) {
                         overlayAssignments.remove(overlayId);
+                        originNormalized.remove(overlayId);
                         markAssignmentsDirty();
                         log.debug("Released overlay {} from all regions (dropped in empty space)", overlayId);
                     }
@@ -1635,16 +1742,41 @@ public class AnchorCustomizerPlugin extends Plugin {
                     continue;
                 }
 
-                Point targetPoint = new Point(targetX, targetY);
-                Point currentLoc = overlay.getPreferredLocation();
-                if (currentLoc == null || currentLoc.x != targetX || currentLoc.y != targetY) {
-                    overlay.setPreferredLocation(targetPoint);
-                }
+                // Neutralize any RIGHT/CENTRE/BOTTOM origin RuneLite assigned on the last drag, once,
+                // so preferredLocation is absolute again. resetOverlay clears the location; the write
+                // below restores it the same iteration.
+                normalizeOrigin(overlay, overlayId);
+
+                // targetX/targetY are absolute canvas coords; with a normalized LEFT/TOP origin this
+                // is a plain absolute, idempotent write.
+                setAbsoluteLocation(overlay, new Point(targetX, targetY));
 
                 // Remember this target so onBeforeRender can re-assert it every frame,
                 // closing the 1-frame gap where a RuneLite relayout would otherwise show
                 // the overlay at its default position until the next client tick.
                 overlayTargets.put(overlayId, new Point(targetX, targetY));
+            }
+        }
+
+        // Opt-in diagnostic: for every assigned overlay, dump why it is (or isn't) following
+        // its anchor — tracked?, in a bucket this tick?, where the snap targeted it vs where it
+        // actually rendered, and whether the live render bounds drifted from our target (the
+        // signature of an owning plugin, e.g. Resizable Chat, fighting our positioning).
+        if (config != null && config.debugLogging()
+                && (nowMs - lastFollowLogTime) >= FOLLOW_LOG_INTERVAL_MS
+                && !overlayAssignments.isEmpty()) {
+            lastFollowLogTime = nowMs;
+            for (Map.Entry<String, Integer> a : overlayAssignments.entrySet()) {
+                String id = a.getKey();
+                Overlay ov = trackedOverlays.get(id);
+                if (ov == null) ov = movableOverlayByKey.get(id);
+                Point target = overlayTargets.get(id);
+                Point loc = ov == null ? null : ov.getPreferredLocation();
+                Rectangle b = ov == null ? null : ov.getBounds();
+                log.info("[anchor-follow] overlay={} region={} tracked={} movable={} dragging={} target={} prefLoc={} bounds={}",
+                        id, a.getValue(), trackedOverlays.containsKey(id),
+                        ov != null && ov.isMovable(), draggingIds.contains(id),
+                        target, loc, b);
             }
         }
 
@@ -1846,13 +1978,33 @@ public class AnchorCustomizerPlugin extends Plugin {
      * which is the same rectangle RuneLite itself uses for overlay hit-testing.
      */
     public boolean isMovableOverlayAt(Point p) {
-        if (p == null) return false;
-        return overlayManager.anyMatch(ov -> {
+        return getMovableOverlayAt(p) != null;
+    }
+
+    /**
+     * The movable RuneLite overlay currently rendered under {@code p}, or null. Returned to
+     * {@link AnchorInputListener} so it can drag that overlay directly when the user Alt-presses
+     * on a UI element inside a region (the "pointer on the UI -> the UI moves" rule), rather than
+     * relying on RuneLite's OverlayRenderer to grab it — which is unreliable under 117 HD.
+     *
+     * Thread-safety: invoked from the AWT event thread. {@link OverlayManager#anyMatch} iterates
+     * a copy-on-write list, so concurrent client-thread ticks are safe. {@code getBounds()} is
+     * the last-rendered rectangle — the same one RuneLite uses for overlay hit-testing.
+     */
+    public Overlay getMovableOverlayAt(Point p) {
+        if (p == null) return null;
+        final Overlay[] found = {null};
+        overlayManager.anyMatch(ov -> {
             if (ov == null || ov == customizerOverlay) return false;
             if (!ov.isMovable()) return false;
             Rectangle b = ov.getBounds();
-            return b != null && !b.isEmpty() && b.contains(p);
+            if (b != null && !b.isEmpty() && b.contains(p)) {
+                found[0] = ov;
+                return true;
+            }
+            return false;
         });
+        return found[0];
     }
 
     /**
@@ -1965,11 +2117,11 @@ public class AnchorCustomizerPlugin extends Plugin {
                 // Fix L1: seed preferredLocation if missing or out-of-region
                 AnchorRegion region = regionsById.get(assignedRegionId);
                 if (region != null) {
-                    Point loc = overlay.getPreferredLocation();
+                    Point loc = absoluteTopLeftOf(overlay);
                     Rectangle regionBounds = region.getBounds();
                     boolean needsSeed = loc == null || !regionBounds.contains(loc);
                     if (needsSeed) {
-                        overlay.setPreferredLocation(new Point(region.getX(), region.getY()));
+                        setAbsoluteLocation(overlay, new Point(region.getX(), region.getY()));
                         // Null position (not DYNAMIC) so the UNDER_WIDGETS->ABOVE_WIDGETS
                         // promotion applies; the next snap tick's saveOverlay rebuilds layers.
                         if (overlay.getPreferredPosition() != null) {
@@ -2021,6 +2173,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                 Point last = lastSeenLocations.get(id);
                 if (last != null && !cur.equals(last)) {
                     lastExternalMoveTime.put(id, now);
+                    // RuneLite may have re-derived this overlay's origin during the drag; re-arm
+                    // normalization so the next settle resets it back to LEFT/TOP.
+                    originNormalized.remove(id);
                 }
             }
             return false; // scan all
@@ -2036,6 +2191,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                 Map.Entry<String, Overlay> entry = it.next();
                 if (!present.contains(entry.getValue())) {
                     it.remove();
+                    originNormalized.remove(entry.getKey());
                     log.debug("Removed stale overlay reference: {}", entry.getKey());
                 }
             }

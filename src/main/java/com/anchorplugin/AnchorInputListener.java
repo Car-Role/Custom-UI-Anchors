@@ -13,13 +13,16 @@ import java.util.List;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
-import net.runelite.api.Client;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.input.MouseListener;
+import net.runelite.client.ui.ClientUI;
+import net.runelite.client.ui.overlay.Overlay;
 
+@Slf4j
 public class AnchorInputListener implements MouseListener {
     private static final int RESIZE_HANDLE_SIZE = 10;
 
-    private final Client client;
+    private final ClientUI clientUI;
     private final AnchorCustomizerPlugin plugin;
 
     @Getter
@@ -30,6 +33,16 @@ public class AnchorInputListener implements MouseListener {
 
     private Point dragStartPoint = null;
     private Rectangle originalBounds = null;
+
+    // Overlay drag state. When the user Alt-presses directly on a movable RuneLite overlay
+    // inside a region, we move that overlay ourselves (rather than the anchor) so the rule
+    // "pointer on the UI -> the UI moves" holds even when RuneLite's OverlayRenderer fails to
+    // grab it (observed with 117 HD). Updating the overlay's preferredLocation is exactly what
+    // OverlayRenderer's drag does, so the plugin's existing external-move detection backs the
+    // snap off and runs capture/release on drop automatically.
+    private Overlay draggedOverlay = null;
+    private int overlayGrabDx = 0;
+    private int overlayGrabDy = 0;
 
     // Resize state
     private boolean isResizing = false;
@@ -42,16 +55,29 @@ public class AnchorInputListener implements MouseListener {
     private static final int WEST = 8;
 
     @Inject
-    public AnchorInputListener(Client client, AnchorCustomizerPlugin plugin) {
-        this.client = client;
+    public AnchorInputListener(ClientUI clientUI, AnchorCustomizerPlugin plugin) {
+        this.clientUI = clientUI;
         this.plugin = plugin;
     }
 
     @Override
     public MouseEvent mousePressed(MouseEvent e) {
-        if (!plugin.isOverlaysVisible())
-            return e;
-        if (!plugin.isDragKeyHeld() || SwingUtilities.isRightMouseButton(e)) {
+        // Resolve the edit hotkey from live key state + event modifiers, not the tracked
+        // flag, so a desynced flag (focus blips around the 117 HD canvas, a consumed
+        // non-modifier hotkey press, a missed release) can't silently block drags.
+        final boolean hotkeyActive = plugin.isDragHotkeyActive(e);
+
+        AnchorCustomizerConfig cfg = plugin.getConfig();
+        if (cfg != null && cfg.debugLogging() && SwingUtilities.isLeftMouseButton(e)
+                && (hotkeyActive || e.isAltDown() || plugin.isDragKeyHeld())) {
+            Point dp = e.getPoint();
+            Overlay dbgOverlay = plugin.getMovableOverlayAt(dp);
+            log.info("[anchor-debug] mousePressed hotkeyLive={} trackedHeld={} overlaysVisible={} altDown={} at=({},{}) topRegion={} overlay={}",
+                    hotkeyActive, plugin.isDragKeyHeld(), plugin.isOverlaysVisible(), e.isAltDown(),
+                    dp.x, dp.y, regionLabel(pickTopAnchorAt(dp)), dbgOverlay == null ? "none" : dbgOverlay.getName());
+        }
+
+        if (!hotkeyActive || SwingUtilities.isRightMouseButton(e)) {
             return e;
         }
 
@@ -61,17 +87,21 @@ public class AnchorInputListener implements MouseListener {
             return e;
         }
 
-        // Overlay passthrough: if the user Alt+pressed directly on top of a movable
-        // RuneLite overlay (e.g. a detached InfoBoxOverlay rendered inside one of our
-        // anchor regions), yield to RuneLite's OverlayRenderer so it can start its
-        // own drag. Without this, we silently consume the event and the overlay
-        // appears uninteractable. We still let the click reach mouseClicked for
-        // selection, but only when the user is clicking empty space inside a region
-        // do we proceed with anchor drag/resize.
-        if (plugin.isMovableOverlayAt(mousePos)) {
+        // Pointer-on-UI rule: if a movable RuneLite overlay sits under the cursor, drag THAT
+        // overlay, never the anchor. We only get here when OverlayRenderer did not already
+        // grab the press (it runs first in the MouseManager chain and consumes when it does),
+        // so handling it ourselves is the fallback that keeps overlay dragging working even
+        // when OverlayRenderer can't grab it (observed with 117 HD). We consume either way so
+        // the press can never fall through to the game and rotate the camera.
+        Overlay overlay = plugin.getMovableOverlayAt(mousePos);
+        if (overlay != null) {
+            beginOverlayDrag(overlay, mousePos);
+            plugin.selectAnchor(region);
+            e.consume();
             return e;
         }
 
+        // Empty region area: drag/resize the anchor itself.
         Rectangle bounds = region.getBounds();
         isDragging = true;
         draggedAnchor = region;
@@ -89,10 +119,46 @@ public class AnchorInputListener implements MouseListener {
         return e;
     }
 
+    /**
+     * Start dragging a movable overlay ourselves. We record the grab offset from the overlay's
+     * current rendered top-left so the overlay tracks the cursor 1:1, and detach it from any
+     * snap corner so the renderer honours its preferredLocation while we move it. The plugin's
+     * external-move detection then backs the snap off and commits capture/release on drop.
+     */
+    private void beginOverlayDrag(Overlay overlay, Point mousePos) {
+        draggedOverlay = overlay;
+        Rectangle b = overlay.getBounds();
+        Point loc = (b != null && !b.isEmpty()) ? new Point(b.x, b.y) : overlay.getPreferredLocation();
+        if (loc == null) {
+            loc = new Point(mousePos);
+        }
+        overlayGrabDx = mousePos.x - loc.x;
+        overlayGrabDy = mousePos.y - loc.y;
+        if (overlay.getPreferredPosition() != null) {
+            overlay.setPreferredPosition(null);
+        }
+    }
+
     @Override
     public MouseEvent mouseDragged(MouseEvent e) {
-        if (!plugin.isOverlaysVisible())
+        // Overlay drag (pointer-on-UI): move the overlay's preferred location to follow the
+        // cursor. The plugin's external-move detection sees this, stops snapping the overlay,
+        // and commits capture/release once the drag settles — same path as an OverlayRenderer
+        // drag, just initiated by us so it works regardless of OverlayRenderer's hover state.
+        if (draggedOverlay != null) {
+            Point p = e.getPoint();
+            // The overlay was normalized to a LEFT/TOP origin on capture, so preferredLocation is
+            // absolute; write the cursor-relative target directly. On drop the snap pass re-normalizes
+            // (if RuneLite changed the origin during this drag) and reasserts the anchored position.
+            draggedOverlay.setPreferredLocation(new Point(p.x - overlayGrabDx, p.y - overlayGrabDy));
+            plugin.requestSnap();
+            e.consume();
             return e;
+        }
+
+        // isDragging is only set by mousePressed after the hotkey gate, so it is the
+        // authoritative signal here. Don't re-check the (possibly-desynced) hotkey/panel
+        // state mid-drag, or a transient flag flip could abort a legitimate drag.
         if (!isDragging || draggedAnchor == null) {
             return e;
         }
@@ -120,7 +186,23 @@ public class AnchorInputListener implements MouseListener {
 
     @Override
     public MouseEvent mouseReleased(MouseEvent e) {
-        if (!plugin.isOverlaysVisible() && !isDragging)
+        final boolean hotkeyActive = plugin.isDragHotkeyActive(e);
+
+        // Finish an overlay drag. The overlay's final preferredLocation is already set; the
+        // plugin's next snap pass treats it as "hot" and commits the capture (into whatever
+        // region now contains it) or release (dropped in empty space). Just clear our state,
+        // nudge a snap, and consume so the release can't reach the game.
+        if (draggedOverlay != null) {
+            draggedOverlay = null;
+            plugin.requestSnap();
+            e.consume();
+            if (!hotkeyActive) {
+                resetCursorToDefault();
+            }
+            return e;
+        }
+
+        if (!isDragging && !plugin.isOverlaysVisible() && !hotkeyActive)
             return e;
         if (isDragging) {
             // Capture the dragged region before clearing state so we can rebaseline
@@ -144,22 +226,21 @@ public class AnchorInputListener implements MouseListener {
         // If the hotkey is no longer held (e.g. the user released Alt mid-drag and then
         // let go of the mouse without moving it), mouseMoved won't fire to clear the
         // move/resize cursor — reset it here so it can't get stuck.
-        if (!plugin.isDragKeyHeld()) {
+        if (!hotkeyActive) {
             resetCursorToDefault();
         }
         return e;
     }
 
     /**
-     * Reset the canvas cursor to the default arrow. Safe to call from the AWT event thread
-     * (the same thread the other cursor mutations in this class run on). No-op if the canvas
-     * is briefly unavailable around client startup/shutdown.
+     * Restore the cursor to RuneLite's current baseline via {@link ClientUI}. When the Custom
+     * Cursor plugin is active this is the user's custom cursor (ClientUI tracks it as the
+     * "default"); otherwise it is the system arrow. Routing through ClientUI — exactly like
+     * RuneLite's own OverlayRenderer — and never setting a cursor on the game canvas directly
+     * is what stops us from stranding the custom cursor (GitHub: custom cursor disabled on Alt).
      */
     public void resetCursorToDefault() {
-        java.awt.Canvas canvas = client.getCanvas();
-        if (canvas != null) {
-            canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
-        }
+        clientUI.setCursor(clientUI.getDefaultCursor());
     }
 
     /**
@@ -171,6 +252,12 @@ public class AnchorInputListener implements MouseListener {
      * restored anchor. No-op when nothing is being dragged.
      */
     public void cancelDrag() {
+        // Drop any in-progress overlay drag where it currently sits — the plugin's snap pass
+        // captures/releases it. We intentionally don't revert overlay position on cancel.
+        if (draggedOverlay != null) {
+            draggedOverlay = null;
+            plugin.requestSnap();
+        }
         if (!isDragging || draggedAnchor == null) {
             return;
         }
@@ -191,7 +278,8 @@ public class AnchorInputListener implements MouseListener {
 
     @Override
     public MouseEvent mouseClicked(MouseEvent e) {
-        if (!plugin.isOverlaysVisible())
+        final boolean hotkeyActive = plugin.isDragHotkeyActive(e);
+        if (!plugin.isOverlaysVisible() && !hotkeyActive)
             return e;
 
         // Click-through for overlapping anchors:
@@ -204,12 +292,13 @@ public class AnchorInputListener implements MouseListener {
         AnchorRegion picked = pickAnchorByClickCount(mousePos, e.getClickCount());
         if (picked != null) {
             plugin.selectAnchor(picked);
-            // Overlay passthrough (mirrors mousePressed): if the click landed on a
-            // movable overlay, do not consume — let RuneLite handle Alt+click on it.
-            if (plugin.isDragKeyHeld() && !plugin.isMovableOverlayAt(mousePos)) {
+            // In edit mode, consume Alt-clicks inside a region (even on an overlay) so they
+            // can't fall through to the game / rotate the camera. Dragging the overlay vs the
+            // anchor is decided in mousePressed; the click itself only updates selection.
+            if (hotkeyActive) {
                 e.consume();
             }
-        } else if (plugin.isDragKeyHeld()) {
+        } else if (hotkeyActive) {
             // Only deselect if Alt is held (explicit edit intention); clicking into
             // empty space without Alt should not drop the panel selection.
             plugin.selectAnchor(null);
@@ -295,37 +384,47 @@ public class AnchorInputListener implements MouseListener {
 
     @Override
     public MouseEvent mouseMoved(MouseEvent e) {
-        if (!plugin.isOverlaysVisible()) {
+        final boolean hotkeyActive = plugin.isDragHotkeyActive(e);
+        if (!plugin.isOverlaysVisible() && !hotkeyActive) {
             return e;
         }
-        // Canvas can briefly be null around client startup/shutdown; skip cursor updates
-        // rather than NPE.
-        java.awt.Canvas canvas = client.getCanvas();
-        if (canvas == null) {
+        if (!hotkeyActive) {
+            // Not in edit mode: clear any stale move/resize cursor by restoring the ClientUI
+            // baseline (the Custom Cursor plugin's cursor if one is set, else the arrow).
+            clientUI.setCursor(clientUI.getDefaultCursor());
             return e;
         }
-        if (!plugin.isDragKeyHeld()) {
-            // Ensure cursor is reset if we released Alt while hovering
-            canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+
+        // Over a movable overlay, leave the cursor to RuneLite's OverlayRenderer (which set it
+        // just before/after us). It decides resize-vs-move from the cursor at press time, so if
+        // we overwrote it with our anchor MOVE/resize cursor it would mis-pick resize and the
+        // overlay wouldn't drag (the regression that broke dragging UI inside a region).
+        if (plugin.isMovableOverlayAt(e.getPoint())) {
             return e;
         }
 
         // Update cursor based on hover. Use the pick path so the cursor reflects the
         // region a click would actually hit: topmost unlocked first, locked regions
-        // click-through (no move/resize cursor over them).
+        // click-through (no move/resize cursor over them). All cursor changes go through
+        // ClientUI (never the game canvas) so we never strand the custom cursor.
         AnchorRegion hover = pickTopAnchorAt(e.getPoint());
         if (hover != null) {
             int dir = getResizeDirection(hover.getBounds(), e.getPoint());
-            canvas.setCursor(getCursorForDirection(dir));
+            clientUI.setCursor(getCursorForDirection(dir));
             return e;
         }
 
-        // Reset cursor if not colliding with any region
-        canvas.setCursor(Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR));
+        // Not over any region: restore the ClientUI baseline cursor.
+        clientUI.setCursor(clientUI.getDefaultCursor());
         return e;
     }
 
     // Helper methods
+
+    /** Null-safe label for an anchor region, used only by the opt-in debug logging. */
+    private static String regionLabel(AnchorRegion r) {
+        return r == null ? "none" : (r.getName() + "#" + r.getId());
+    }
 
     private void handleMove(int dx, int dy) {
         draggedAnchor.setX(originalBounds.x + dx);
