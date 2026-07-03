@@ -64,24 +64,31 @@ public class AnchorRegion {
 
     // Deep copy with all geometry fields (live x/y/w/h and the origin snapshot)
     // multiplied by the given factor and rounded to the nearest pixel. Used by the
-    // resolution-profile system to convert between a profile's canonical coordinate
-    // space (stored at the family's base resolution) and the live coordinate space
-    // of the current monitor. factor == 1.0 yields a plain deep copy.
+    // resolution-profile system for deep copies (factor == 1.0) and for the one-time
+    // seed of a brand-new profile from the outgoing layout.
     public AnchorRegion scaledCopy(double factor) {
+        return scaledCopy(factor, factor);
+    }
+
+    // Per-axis variant: horizontal fields (x/width and their origins) scale by fx,
+    // vertical fields by fy. Used when seeding a new resolution profile from the
+    // observed canvas change, whose axes rarely scale by exactly the same ratio
+    // (window chrome, taskbar, sidebar).
+    public AnchorRegion scaledCopy(double fx, double fy) {
         return new AnchorRegion(
                 id,
                 name,
-                (int) Math.round(x * factor),
-                (int) Math.round(y * factor),
-                (int) Math.round(width * factor),
-                (int) Math.round(height * factor),
+                (int) Math.round(x * fx),
+                (int) Math.round(y * fy),
+                (int) Math.round(width * fx),
+                (int) Math.round(height * fy),
                 constraint,
                 alignment,
                 stacking,
                 locked,
-                (int) Math.round(originX * factor),
-                (int) Math.round(originY * factor),
-                (int) Math.round(originW * factor),
-                (int) Math.round(originH * factor));
+                (int) Math.round(originX * fx),
+                (int) Math.round(originY * fy),
+                (int) Math.round(originW * fx),
+                (int) Math.round(originH * fy));
     }
 }
