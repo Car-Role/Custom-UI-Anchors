@@ -113,14 +113,17 @@ public class AnchorCustomizerPlugin extends Plugin {
     //                  (NOT the canvas size — window resizes within one monitor stay in
     //                  one profile and are handled by the origin-derivation tick loop).
     //
-    // Scaling families: monitor resolutions related by an exact integer factor (e.g.
-    // 1920x1080 and 3840x2160) share ONE canonical layout, stored at the family's base
-    // resolution (the key). Live geometry = canonical * factor; edits convert back via
-    // / factor with rounding on save. Resolutions that are not integer multiples (e.g.
-    // 1080p vs 1440p) are fully independent tracks after a one-time seed.
+    // Every monitor resolution is a fully INDEPENDENT profile storing absolute pixel
+    // geometry — edits on one monitor never propagate to another. (An earlier design
+    // shared one scaled canonical across integer-related resolutions, e.g. 1080p/4K at
+    // x2; that assumed the canvas scales with the monitor, which is false when a
+    // fixed-size window is dragged across monitors, and its shared write-back clobbered
+    // sibling layouts. See GitHub issue on multi-resolution setups.) A brand-new
+    // profile gets a one-time seed from the outgoing live layout, scaled by the
+    // OBSERVED canvas dimension change across the swap — an exact copy when the window
+    // wasn't resized — and is on its own track thereafter.
     private final Map<String, List<AnchorRegion>> profileLayouts = new HashMap<>();
     private String activeProfileKey = null;
-    private double activeProfileFactor = 1.0;
     private String lastWrittenProfilesJson = null;
 
     private static final String FIXED_PROFILE_KEY = "fixed";
@@ -129,17 +132,6 @@ public class AnchorCustomizerPlugin extends Plugin {
     // through the AWT toolkit; no need to poll it at tick rate when nothing changed).
     private long lastProfileCheckTime = 0L;
     private static final long PROFILE_CHECK_INTERVAL_MS = 1000L;
-
-    /** Result of resolving the current client state to a layout profile. */
-    private static final class ProfileMatch {
-        final String key;
-        final double factor;
-
-        ProfileMatch(String key, double factor) {
-            this.key = key;
-            this.factor = factor;
-        }
-    }
 
     // The RuneLite canvas frequently resizes once during the first few hundred ms of
     // plugin life, and again whenever the user transitions between login-screen (fixed
@@ -249,7 +241,6 @@ public class AnchorCustomizerPlugin extends Plugin {
         lastWrittenAssignmentsJson = null;
         lastWrittenProfilesJson = null;
         activeProfileKey = null;
-        activeProfileFactor = 1.0;
         profileLayouts.clear();
         lastProfileCheckTime = 0L;
         lastViewport = null;
@@ -334,8 +325,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
         // loadRegions materializes the legacy "last live layout" snapshot so the panel
         // and login-screen overlays behave exactly as before. The first logged-in tick
-        // resolves the actual layout profile (fixed mode / monitor family) and swaps in
-        // its canonical geometry via switchProfile.
+        // resolves the actual layout profile (fixed mode / monitor resolution) and swaps
+        // in its stored geometry via switchProfile.
         loadRegions();
         loadProfiles();
         loadOverlayAssignments();
@@ -380,7 +371,6 @@ public class AnchorCustomizerPlugin extends Plugin {
         anchorRegions.clear();
         profileLayouts.clear();
         activeProfileKey = null;
-        activeProfileFactor = 1.0;
         trackedOverlays.clear();
         overlayAssignments.clear();
         overlayOrder.clear();
@@ -420,19 +410,16 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
             clientThread.invoke(() -> {
                 // Remote profile update (another machine edited some profile). Reload the
-                // map; if our active profile's canonical changed, re-materialize it.
+                // map; if our active profile's stored layout changed, re-materialize it.
                 loadProfiles();
                 if (activeProfileKey == null) {
                     return;
                 }
-                List<AnchorRegion> canonical = profileLayouts.get(activeProfileKey);
-                if (canonical == null) {
+                List<AnchorRegion> stored = profileLayouts.get(activeProfileKey);
+                if (stored == null) {
                     return;
                 }
-                List<AnchorRegion> live = new ArrayList<>();
-                for (AnchorRegion r : canonical) {
-                    live.add(r.scaledCopy(activeProfileFactor));
-                }
+                List<AnchorRegion> live = deepCopy(stored);
                 live = normalizeRegions(live);
                 anchorRegions.clear();
                 anchorRegions.addAll(live);
@@ -815,14 +802,14 @@ public class AnchorCustomizerPlugin extends Plugin {
         config.setRegionJson(json);
 
         // Authoritative per-profile storage: fold the live layout back into the active
-        // profile's canonical (base-resolution) space. The actual config write is
+        // profile's entry (absolute pixels, deep-copied). The actual config write is
         // DEBOUNCED via flushPendingSaves — saveRegions runs every tick during a window
         // resize, and serializing the whole profile map + firing a second ConfigChanged
         // through the event bus at 50 Hz was measurably costing frame time. The in-memory
         // map is always current; only the persistence is deferred (and force-flushed on
         // shutDown / profile switches).
         if (activeProfileKey != null) {
-            profileLayouts.put(activeProfileKey, toCanonical(snapshot, activeProfileFactor));
+            profileLayouts.put(activeProfileKey, deepCopy(snapshot));
         }
         profilesDirty = true;
         regionsDirty = false;
@@ -831,51 +818,36 @@ public class AnchorCustomizerPlugin extends Plugin {
     // ---- Resolution profile core ----------------------------------------------------
 
     /**
-     * Convert a live region list into the canonical coordinate space of a profile
-     * (live / factor, rounded). Always deep-copies so the stored layouts never alias
-     * live region objects mutated by the input listener or panel.
+     * Deep-copy a region list so the stored layouts never alias live region objects
+     * mutated by the input listener or panel (and vice versa on materialization).
      */
-    private List<AnchorRegion> toCanonical(List<AnchorRegion> live, double factor) {
-        List<AnchorRegion> out = new ArrayList<>(live.size());
-        double inv = (factor == 1.0) ? 1.0 : 1.0 / factor;
-        for (AnchorRegion r : live) {
-            out.add(r.scaledCopy(inv));
+    private List<AnchorRegion> deepCopy(List<AnchorRegion> regions) {
+        List<AnchorRegion> out = new ArrayList<>(regions.size());
+        for (AnchorRegion r : regions) {
+            out.add(r.scaledCopy(1.0));
         }
         return out;
     }
 
-    /** Parse a "WxH" profile key into {w, h}; null for "fixed" or malformed keys. */
-    private static int[] parseProfileKey(String key) {
-        if (key == null || FIXED_PROFILE_KEY.equals(key)) return null;
-        int sep = key.indexOf('x');
-        if (sep <= 0) return null;
-        try {
-            int w = Integer.parseInt(key.substring(0, sep));
-            int h = Integer.parseInt(key.substring(sep + 1));
-            return (w > 0 && h > 0) ? new int[] { w, h } : null;
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
-
     /**
-     * Resolve the current client state to a layout profile.
+     * Resolve the current client state to a layout profile key.
      *
      * Fixed client mode always maps to the universal {@code "fixed"} profile (canvas is
      * 765x503 everywhere). Resizable mode is keyed by the monitor's display-mode
-     * resolution; if an existing profile's base resolution relates to it by an exact
-     * integer factor (same factor on both axes), that family is reused with the
-     * corresponding scale factor. Otherwise a new family is started with this monitor
-     * as its base (factor 1).
+     * resolution — every distinct resolution is its own fully independent profile.
+     * (Deliberately NO integer-factor "family" matching: inferring a scale factor from
+     * monitor resolution ratios corrupted layouts on multi-resolution setups where the
+     * window keeps its pixel size across monitors, and the shared write-back meant
+     * editing on one monitor clobbered its sibling's layout.)
      *
      * Returns null when the client state can't be resolved yet (no canvas, no graphics
      * configuration, degenerate display mode) — callers simply retry next tick.
      */
-    private ProfileMatch computeProfileMatch() {
+    private String computeProfileMatch() {
         java.awt.Canvas canvas = client.getCanvas();
         if (canvas == null) return null;
         if (!client.isResized()) {
-            return new ProfileMatch(FIXED_PROFILE_KEY, 1.0);
+            return FIXED_PROFILE_KEY;
         }
         java.awt.GraphicsConfiguration gc = canvas.getGraphicsConfiguration();
         if (gc == null) return null;
@@ -883,52 +855,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         int mw = dm.getWidth();
         int mh = dm.getHeight();
         if (mw <= 0 || mh <= 0) return null;
-
-        String exact = mw + "x" + mh;
-        if (profileLayouts.containsKey(exact)) {
-            return new ProfileMatch(exact, 1.0);
-        }
-
-        // Family search: prefer the largest base that divides this monitor exactly
-        // (deterministic if multiple match), then bases this monitor divides exactly.
-        ProfileMatch best = null;
-        for (String key : profileLayouts.keySet()) {
-            int[] base = parseProfileKey(key);
-            if (base == null) continue;
-            if (mw % base[0] == 0 && mh % base[1] == 0 && mw / base[0] == mh / base[1]) {
-                double f = mw / (double) base[0];
-                if (best == null || f < best.factor) best = new ProfileMatch(key, f);
-            } else if (base[0] % mw == 0 && base[1] % mh == 0 && base[0] / mw == base[1] / mh) {
-                double f = 1.0 / (base[0] / mw);
-                if (best == null) best = new ProfileMatch(key, f);
-            }
-        }
-        if (best != null) return best;
-
-        // Unknown resolution: start a new family with this monitor as its base.
-        return new ProfileMatch(exact, 1.0);
-    }
-
-    /**
-     * One-time seed ratio for a brand-new profile, derived from the outgoing profile's
-     * effective monitor resolution (base * factor). Clean = same ratio on both axes and
-     * a positive multiple of 1/6 — covers the real-world ladder: 2 (1080p->4K),
-     * 1.5 (1440p->4K), 4/3 (1080p->1440p) and their inverses. Returns NaN when no
-     * clean ratio exists (including any transition involving fixed mode), in which case
-     * the caller falls back to constraint/origin derivation + clamping.
-     */
-    private double cleanSeedRatio(String fromKey, double fromFactor, String toKey) {
-        int[] from = parseProfileKey(fromKey);
-        int[] to = parseProfileKey(toKey);
-        if (from == null || to == null || fromFactor <= 0) return Double.NaN;
-        double fw = from[0] * fromFactor;
-        double fh = from[1] * fromFactor;
-        double rw = to[0] / fw;
-        double rh = to[1] / fh;
-        if (rw <= 0 || Math.abs(rw - rh) > 1e-9) return Double.NaN;
-        double sixths = rw * 6.0;
-        if (Math.abs(sixths - Math.round(sixths)) > 1e-9) return Double.NaN;
-        return rw;
+        return mw + "x" + mh;
     }
 
     /** Clamp a region fully on-canvas (and shrink it if larger than the canvas). */
@@ -945,42 +872,57 @@ public class AnchorCustomizerPlugin extends Plugin {
      * from onClientTick).
      *
      * Steps: fold the outgoing live layout back into its profile entry; materialize the
-     * incoming profile's canonical layout at its factor (or seed a new profile from the
-     * outgoing layout — exact ratio scaling when clean, otherwise as-is and let the
-     * constraint derivation place it); derive to the actual canvas; clamp only when
-     * seeding (never fight a layout the user saved deliberately); rebaseline origins;
-     * persist; refresh the panel.
+     * incoming profile's stored layout as-is (or seed a brand-new profile from the
+     * outgoing layout, scaled once by the OBSERVED canvas dimension change across the
+     * swap — an exact pixel-perfect copy when the window wasn't resized, e.g. a plain
+     * drag to another monitor); derive to the actual canvas; clamp only when seeding
+     * (never fight a layout the user saved deliberately); rebaseline origins; persist;
+     * refresh the panel.
+     *
+     * After the one-time seed a profile is fully independent — edits never propagate
+     * across monitors.
      */
-    private void switchProfile(ProfileMatch match, Dimension currentDim) {
+    private void switchProfile(String key, Dimension currentDim) {
         // Never carry an in-progress drag across a layout swap — the dragged object
         // would be orphaned from the new live list.
         inputListener.cancelDrag();
 
         if (activeProfileKey != null) {
-            profileLayouts.put(activeProfileKey, toCanonical(new ArrayList<>(anchorRegions), activeProfileFactor));
+            profileLayouts.put(activeProfileKey, deepCopy(anchorRegions));
         }
 
-        List<AnchorRegion> canonical = profileLayouts.get(match.key);
-        boolean seeded = (canonical == null);
-        List<AnchorRegion> live = new ArrayList<>();
+        List<AnchorRegion> stored = profileLayouts.get(key);
+        boolean seeded = (stored == null);
+        List<AnchorRegion> live;
         if (!seeded) {
-            for (AnchorRegion r : canonical) {
-                live.add(r.scaledCopy(match.factor));
-            }
-            live = normalizeRegions(live);
+            live = normalizeRegions(deepCopy(stored));
         } else {
-            double ratio = cleanSeedRatio(activeProfileKey, activeProfileFactor, match.key);
-            double f = Double.isNaN(ratio) ? 1.0 : ratio;
+            // One-time seed: scale by the actual canvas change across this swap
+            // (lastViewport still holds the pre-swap dim here; the tick loop updates
+            // it after we return). Per-axis, since window chrome means maximized
+            // canvases are not exact monitor-ratio multiples. Ratios near 1 collapse
+            // to an exact copy so an un-resized cross-monitor drag stays pixel-perfect.
+            // Only meaningful for a real swap from a live profile — the startup
+            // resolution (activeProfileKey == null) always copies as-is.
+            double fx = 1.0;
+            double fy = 1.0;
+            if (activeProfileKey != null && lastViewport != null
+                    && lastViewport.width > 0 && lastViewport.height > 0) {
+                fx = currentDim.width / (double) lastViewport.width;
+                fy = currentDim.height / (double) lastViewport.height;
+                if (Math.abs(fx - 1.0) < 0.02) fx = 1.0;
+                if (Math.abs(fy - 1.0) < 0.02) fy = 1.0;
+            }
+            live = new ArrayList<>(anchorRegions.size());
             for (AnchorRegion r : anchorRegions) {
-                live.add(r.scaledCopy(f));
+                live.add(r.scaledCopy(fx, fy));
             }
         }
 
         String fromKey = activeProfileKey;
         anchorRegions.clear();
         anchorRegions.addAll(live);
-        activeProfileKey = match.key;
-        activeProfileFactor = match.factor;
+        activeProfileKey = key;
 
         for (AnchorRegion r : anchorRegions) {
             recomputePosition(r, currentDim);
@@ -990,7 +932,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             rebaselineOrigin(r);
         }
 
-        log.debug("Switched layout profile {} -> {} (factor {}, seeded={})", fromKey, match.key, match.factor, seeded);
+        log.debug("Switched layout profile {} -> {} (seeded={})", fromKey, key, seeded);
         saveRegions();
         // Profile swaps are rare and important — persist immediately rather than waiting
         // for the debounced flush.
@@ -1141,7 +1083,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                 }
 
                 if (!inStartupGrace && loggedIn) {
-                    // Resolve the layout profile (fixed mode / monitor family) and swap
+                    // Resolve the layout profile (fixed mode / monitor resolution) and swap
                     // layouts when it changes — first logged-in tick, fixed/resizable
                     // toggles, and cross-monitor moves all land here. switchProfile
                     // derives, clamps (seed only), rebaselines and persists, so the
@@ -1157,16 +1099,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                             || (now - lastProfileCheckTime) >= PROFILE_CHECK_INTERVAL_MS;
                     if (checkProfile) {
                         lastProfileCheckTime = now;
-                        ProfileMatch match = computeProfileMatch();
-                        // Switch on key change (different profile) OR factor change with
-                        // the same key — the latter happens when the window moves between
-                        // monitors of the SAME family (1080p screen -> 4K screen): the
-                        // family base stays "1920x1080" but live geometry must rescale
-                        // from x1 to x2. switchProfile handles it as save-back at the old
-                        // factor + re-materialize at the new one.
-                        if (match != null && (!match.key.equals(activeProfileKey)
-                                || match.factor != activeProfileFactor)) {
-                            switchProfile(match, currentDim);
+                        String matchKey = computeProfileMatch();
+                        if (matchKey != null && !matchKey.equals(activeProfileKey)) {
+                            switchProfile(matchKey, currentDim);
                             lastViewport = currentDim;
                             snapAndStackOverlays(true);
                             flushPendingSaves(false);
