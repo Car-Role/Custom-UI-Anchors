@@ -8,6 +8,8 @@
 package com.anchorplugin;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 // Gson parameterized-type helpers — used only for JSON (de)serialization of our
 // own config strings. No reflection into RuneLite internals.
 import com.google.gson.reflect.TypeToken;
@@ -29,7 +31,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -100,8 +104,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     private NavigationButton navButton;
     private volatile boolean navButtonAdded = false;
 
+    // Package-private for unit-test substitution.
     @Inject
-    private Gson gson;
+    Gson gson;
 
     // Package-private for unit-test poking (same pattern as the seams below).
     MouseButtonObserver buttonObserver = new MouseButtonObserver();
@@ -2668,6 +2673,155 @@ public class AnchorCustomizerPlugin extends Plugin {
                 }
             }
         }
+    }
+
+    // ---- Clipboard export/import (GitHub issue #23) ----------------------------------
+    //
+    // The layout is exported as a small JSON envelope around the four raw config blobs,
+    // so an import is just a validated write-back followed by the normal load paths.
+
+    private static final String EXPORT_FORMAT = "custom-ui-anchors";
+    private static final int EXPORT_VERSION = 1;
+
+    /**
+     * Serialize the current layout (regions, resolution profiles, overlay assignments and
+     * ordering) to the export JSON envelope. Marshals onto the client thread to flush any
+     * pending debounced saves first so the export can't miss an unflushed edit; blocks the
+     * caller (the panel's EDT) briefly until it completes. Returns null on failure.
+     */
+    public String exportLayoutJson() {
+        final CompletableFuture<String> result = new CompletableFuture<>();
+        clientThread.invoke(() -> {
+            try {
+                flushPendingSaves(true);
+                result.complete(buildExportJson(gson, config));
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        });
+        try {
+            return result.get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("Layout export failed", e);
+            return null;
+        }
+    }
+
+    static String buildExportJson(Gson gson, AnchorCustomizerConfig config) {
+        JsonObject root = new JsonObject();
+        root.addProperty("format", EXPORT_FORMAT);
+        root.addProperty("version", EXPORT_VERSION);
+        root.add("regionJson", parseJsonOr(gson, config.regionJson(), "[]"));
+        root.add("regionProfiles", parseJsonOr(gson, config.regionProfilesJson(), "{}"));
+        root.add("overlayAssignments", parseJsonOr(gson, config.overlayAssignmentsJson(), "{}"));
+        root.add("overlayOrder", parseJsonOr(gson, config.overlayOrderJson(), "{}"));
+        return gson.toJson(root);
+    }
+
+    private static JsonElement parseJsonOr(Gson gson, String json, String fallback) {
+        if (json != null) {
+            try {
+                JsonElement el = gson.fromJson(json, JsonElement.class);
+                if (el != null && !el.isJsonNull()) {
+                    return el;
+                }
+            } catch (Exception ignored) {
+                // fall through to the fallback blob
+            }
+        }
+        return gson.fromJson(fallback, JsonElement.class);
+    }
+
+    /**
+     * Validate clipboard text as a layout export. Returns null when importable, else a
+     * user-facing error message for the panel to show.
+     */
+    public String checkLayoutImport(String json) {
+        if (json == null || json.trim().isEmpty()) {
+            return "The clipboard does not contain a layout.";
+        }
+        JsonElement el;
+        try {
+            el = gson.fromJson(json, JsonElement.class);
+        } catch (Exception e) {
+            return "The clipboard contents are not valid JSON.";
+        }
+        if (!el.isJsonObject()) {
+            return "The clipboard contents are not a Custom UI Anchors layout.";
+        }
+        JsonObject root = el.getAsJsonObject();
+        JsonElement format = root.get("format");
+        if (format == null || !format.isJsonPrimitive() || !EXPORT_FORMAT.equals(format.getAsString())) {
+            return "The clipboard contents are not a Custom UI Anchors layout.";
+        }
+        JsonElement version = root.get("version");
+        int v;
+        try {
+            v = (version != null && version.isJsonPrimitive()) ? version.getAsInt() : -1;
+        } catch (RuntimeException e) {
+            v = -1;
+        }
+        if (v < 0 || v > EXPORT_VERSION) {
+            return "This layout was exported by a newer version of the plugin and cannot be imported.";
+        }
+        return null;
+    }
+
+    /**
+     * Apply a validated layout export, replacing ALL anchors, profiles and overlay
+     * assignments in the current RuneLite profile. Marshals the mutation onto the client
+     * thread (where anchorRegions is iterated); the panel list is refreshed on the EDT.
+     */
+    public void applyLayoutImport(String json) {
+        final JsonObject root = gson.fromJson(json, JsonElement.class).getAsJsonObject();
+        clientThread.invoke(() -> applyLayoutImportOnClientThread(root));
+    }
+
+    void applyLayoutImportOnClientThread(JsonObject root) {
+        String regions = childJsonString(root, "regionJson", "[]");
+        String profiles = childJsonString(root, "regionProfiles", "{}");
+        String assignments = childJsonString(root, "overlayAssignments", "{}");
+        String order = childJsonString(root, "overlayOrder", "{}");
+
+        // Record the written strings before the setters fire ConfigChanged so the
+        // self-suppression in onConfigChanged ignores our own writes.
+        lastWrittenRegionJson = regions;
+        config.setRegionJson(regions);
+        lastWrittenProfilesJson = profiles;
+        config.setRegionProfilesJson(profiles);
+        lastWrittenAssignmentsJson = assignments;
+        config.setOverlayAssignmentsJson(assignments);
+        lastWrittenOrderJson = order;
+        config.setOverlayOrderJson(order);
+
+        // Drop all runtime state derived from the previous layout, then re-run the
+        // normal load path so the imported data flows through the same hygiene.
+        activeProfileKey = null;
+        profileLayouts.clear();
+        trackedOverlays.clear();
+        originNormalized.clear();
+        overlayTargets.clear();
+        lastExternalMoveTime.clear();
+        lastUserMoveTime.clear();
+
+        loadRegions();
+        loadProfiles();
+        loadOverlayAssignments();
+        loadOverlayOrder();
+        scanAndReacquireOverlays();
+        requestSnap();
+
+        final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
+        SwingUtilities.invokeLater(() -> {
+            if (panel != null) {
+                panel.updateList(snap);
+            }
+        });
+    }
+
+    private String childJsonString(JsonObject root, String key, String fallback) {
+        JsonElement el = root.get(key);
+        return el == null || el.isJsonNull() ? fallback : gson.toJson(el);
     }
 
     @Provides

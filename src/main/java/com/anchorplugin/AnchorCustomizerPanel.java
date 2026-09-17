@@ -11,8 +11,10 @@ import java.awt.FlowLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.Toolkit;
 import java.util.List;
 import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.StringSelection;
 import java.awt.datatransfer.Transferable;
 import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
@@ -24,6 +26,7 @@ import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSpinner;
@@ -79,7 +82,20 @@ public class AnchorCustomizerPanel extends PluginPanel {
         JPanel topControlPanel = new JPanel(new BorderLayout());
         topControlPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         // topControlPanel.setBorder(new EmptyBorder(0, 0, 10, 0));
-        // No longer strictly needed if empty, but keeping structure for spacing
+
+        // Clipboard export/import of the whole layout (GitHub issue #23); all logic
+        // lives in the plugin, these buttons are just the UI entry points.
+        JPanel ioPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        ioPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        JButton exportButton = new JButton("Export layout");
+        exportButton.setToolTipText("Copy all anchors, profiles and overlay assignments to the clipboard as JSON.");
+        exportButton.addActionListener(e -> exportLayout());
+        JButton importButton = new JButton("Import layout");
+        importButton.setToolTipText("Replace all anchors, profiles and overlay assignments with a layout JSON on the clipboard.");
+        importButton.addActionListener(e -> importLayout());
+        ioPanel.add(exportButton);
+        ioPanel.add(importButton);
+        topControlPanel.add(ioPanel, BorderLayout.CENTER);
 
         listContainer.add(topControlPanel, BorderLayout.NORTH);
 
@@ -545,6 +561,44 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setPinToChat(newPinToChat);
         });
         regionList.repaint(); // Repaint list for name changes
+    }
+
+    /** Export the whole layout to the system clipboard (GitHub issue #23). */
+    private void exportLayout() {
+        String json = plugin.exportLayoutJson();
+        if (json == null) {
+            JOptionPane.showMessageDialog(this, "Layout export failed — see client logs.",
+                    "Custom UI Anchors", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        Toolkit.getDefaultToolkit().getSystemClipboard()
+                .setContents(new StringSelection(json), null);
+        JOptionPane.showMessageDialog(this, "Layout copied to clipboard",
+                "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /** Import a layout from the system clipboard, replacing all current anchors. */
+    private void importLayout() {
+        String text;
+        try {
+            Object data = Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .getData(DataFlavor.stringFlavor);
+            text = data instanceof String ? (String) data : null;
+        } catch (Exception ex) {
+            text = null;
+        }
+        String error = plugin.checkLayoutImport(text);
+        if (error != null) {
+            JOptionPane.showMessageDialog(this, error, "Custom UI Anchors", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        int choice = JOptionPane.showConfirmDialog(this,
+                "This replaces ALL anchors, profiles and overlay assignments in the current RuneLite profile. Continue?",
+                "Import layout", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+        plugin.applyLayoutImport(text);
     }
 
     private void deleteSelectedRegion() {
