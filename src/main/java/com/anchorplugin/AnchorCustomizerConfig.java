@@ -25,6 +25,11 @@ public interface AnchorCustomizerConfig extends Config {
         return 2;
     }
 
+    @ConfigItem(keyName = "drawAboveInterfaces", name = "Render over interfaces", description = "Draw anchored overlays on top of game interfaces such as the bank (RuneLite's default for moved overlays). Turn off to let interfaces cover them instead.", position = 4)
+    default boolean drawAboveInterfaces() {
+        return true;
+    }
+
     @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "Log diagnostic details to the RuneLite client logs when you Alt+click an anchor. Only enable this if you're reproducing a drag/resize problem (e.g. with 117 HD) and sharing logs.", position = 2)
     default boolean debugLogging() {
         return false;

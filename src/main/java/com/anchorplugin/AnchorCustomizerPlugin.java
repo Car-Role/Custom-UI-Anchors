@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
@@ -50,6 +51,7 @@ import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.util.ImageUtil;
 
 @Slf4j
@@ -60,9 +62,10 @@ public class AnchorCustomizerPlugin extends Plugin {
     @Inject
     private Client client;
 
+    // Package-private (not private) so unit tests can substitute in-memory stubs.
     @Inject
     @Getter
-    private AnchorCustomizerConfig config;
+    AnchorCustomizerConfig config;
 
     @Inject
     private OverlayManager overlayManager;
@@ -96,7 +99,14 @@ public class AnchorCustomizerPlugin extends Plugin {
     @Inject
     private Gson gson;
 
-    private final List<AnchorRegion> anchorRegions = new ArrayList<>();
+    // Test seams: unit tests substitute fakes; in production these delegate to the
+    // injected OverlayManager (null in tests, so the delegates must be replaced before
+    // the corresponding code paths run).
+    Consumer<Overlay> resetOverlayHandler = o -> overlayManager.resetOverlay(o);
+    Consumer<Overlay> saveOverlayHandler = o -> overlayManager.saveOverlay(o);
+
+    // Package-private for unit tests.
+    final List<AnchorRegion> anchorRegions = new ArrayList<>();
     private Dimension lastViewport = null;
 
     // ---- Resolution profile system -------------------------------------------------
@@ -447,6 +457,14 @@ public class AnchorCustomizerPlugin extends Plugin {
             clientThread.invoke(this::loadOverlayOrder);
         } else if (event.getKey().equals("showSidebarButton")) {
             SwingUtilities.invokeLater(this::syncSidebarButton);
+        } else if (event.getKey().equals("drawAboveInterfaces")) {
+            // Re-apply the layer policy to every tracked overlay; applyLayerPolicy only
+            // touches overlays whose preferredPosition actually differs from the target.
+            clientThread.invoke(() -> {
+                for (Overlay o : trackedOverlays.values()) {
+                    applyLayerPolicy(o);
+                }
+            });
         }
     }
 
@@ -1248,16 +1266,56 @@ public class AnchorCustomizerPlugin extends Plugin {
      * preferredLocation/Size/Position — the caller re-sets the location immediately, and we preserve
      * any user-set size here. Client-thread only (resetOverlay persists + rebuilds overlay layers).
      */
-    private void normalizeOrigin(Overlay overlay, String overlayId) {
+    private boolean normalizeOrigin(Overlay overlay, String overlayId) {
         if (overlayId == null || originNormalized.contains(overlayId)) {
-            return;
+            return false;
         }
         Dimension savedSize = overlay.getPreferredSize();
-        overlayManager.resetOverlay(overlay);
+        resetOverlayHandler.accept(overlay);
         if (savedSize != null) {
             overlay.setPreferredSize(savedSize);
         }
         originNormalized.add(overlayId);
+        return true;
+    }
+
+    /**
+     * Normalize + position + persist in one step (the tick loop's per-overlay apply).
+     * When a reset happened, {@code resetOverlay}'s internal save persisted
+     * preferredSize=null — so the restored size AND the new location are re-saved here,
+     * AFTER the location write, fixing infobox sizes being lost across sessions
+     * (GitHub issue #25).
+     */
+    void applyAnchorPosition(Overlay overlay, String overlayId, Point target) {
+        boolean didReset = normalizeOrigin(overlay, overlayId);
+        setAbsoluteLocation(overlay, target);
+        // Layer policy is applied AFTER the reset+location write (issue #19 + #25
+        // ordering): reset() nulls preferredPosition, so running the policy first would
+        // need a second save (and a one-tick layer flicker). One saveOverlay covers the
+        // restored size, the new location, and the desired position together.
+        OverlayPosition desired = config.drawAboveInterfaces() ? null : overlay.getPosition();
+        boolean positionChanged = overlay.getPreferredPosition() != desired;
+        if (positionChanged) {
+            overlay.setPreferredPosition(desired);
+        }
+        if (didReset || positionChanged) {
+            saveOverlayHandler.accept(overlay);
+        }
+    }
+
+    /**
+     * Enforce the global "draw above interfaces" layer policy (GitHub issue #19). With
+     * the option on, preferredPosition stays null so RuneLite promotes the overlay to
+     * ABOVE_WIDGETS (same as a free-dragged overlay); with it off, the overlay's own
+     * default position is restored so interfaces cover it again. Idempotent — only
+     * writes (and saves) when the current value differs.
+     */
+    private void applyLayerPolicy(Overlay overlay) {
+        OverlayPosition desired = config.drawAboveInterfaces() ? null : overlay.getPosition();
+        if (overlay.getPreferredPosition() != desired) {
+            overlay.setPreferredPosition(desired);
+            saveOverlayHandler.accept(overlay);
+        }
     }
 
     private long lastResizeTime = 0;
@@ -1450,6 +1508,10 @@ public class AnchorCustomizerPlugin extends Plugin {
                     // In grace window but not actively moving → this is the drop tick.
                     // Commit the release.
                     if (overlayAssignments.containsKey(overlayId)) {
+                        // RuneLite's drag nulled preferredPosition (promoting the overlay above
+                        // interfaces); honour the "Render over interfaces" setting for UI dragged
+                        // out of a box too, not only while it's anchored.
+                        applyLayerPolicy(overlay);
                         overlayAssignments.remove(overlayId);
                         originNormalized.remove(overlayId);
                         markAssignmentsDirty();
@@ -1654,21 +1716,6 @@ public class AnchorCustomizerPlugin extends Plugin {
                 int targetX = startX + relX;
                 int targetY = startY + relY;
 
-                // Use a NULL preferred position (not DYNAMIC). RuneLite's
-                // OverlayManager.rebuildOverlayLayers() promotes an UNDER_WIDGETS overlay to
-                // ABOVE_WIDGETS only when preferredPosition == null && preferredLocation != null
-                // — the same promotion it applies to any overlay the user free-drags onto the
-                // screen, "so it can draw over interfaces". Forcing DYNAMIC here defeated that
-                // promotion, which is exactly why attached infoboxes rendered behind game UI.
-                // Positioning is unaffected: the renderer draws at preferredLocation whenever it
-                // is non-null, regardless of preferredPosition. saveOverlay() triggers the
-                // one-time layer rebuild so the promotion lands immediately; once the position is
-                // null it stays null and this no-ops on subsequent ticks.
-                if (overlay.getPreferredPosition() != null) {
-                    overlay.setPreferredPosition(null);
-                    overlayManager.saveOverlay(overlay);
-                }
-
                 String overlayId = overlayKey(overlay);
                 if (overlayId == null) continue;
                 // If this overlay is being dragged by the user, don't fight the drag renderer.
@@ -1677,14 +1724,14 @@ public class AnchorCustomizerPlugin extends Plugin {
                     continue;
                 }
 
-                // Neutralize any RIGHT/CENTRE/BOTTOM origin RuneLite assigned on the last drag, once,
-                // so preferredLocation is absolute again. resetOverlay clears the location; the write
-                // below restores it the same iteration.
-                normalizeOrigin(overlay, overlayId);
 
-                // targetX/targetY are absolute canvas coords; with a normalized LEFT/TOP origin this
-                // is a plain absolute, idempotent write.
-                setAbsoluteLocation(overlay, new Point(targetX, targetY));
+                // Neutralize any RIGHT/CENTRE/BOTTOM origin RuneLite assigned on the last drag, once,
+                // so preferredLocation is absolute again; write the absolute target; then apply the
+                // "draw above interfaces" layer policy (GitHub issue #19) — NULL preferred position
+                // (not DYNAMIC) lets rebuildOverlayLayers() promote UNDER_WIDGETS overlays to
+                // ABOVE_WIDGETS like any free-dragged overlay. A single saveOverlay at the end covers
+                // reset + location + position together (GitHub issue #25); subsequent ticks no-op.
+                applyAnchorPosition(overlay, overlayId, new Point(targetX, targetY));
 
                 // Remember this target so onBeforeRender can re-assert it every frame,
                 // closing the 1-frame gap where a RuneLite relayout would otherwise show
@@ -1708,10 +1755,11 @@ public class AnchorCustomizerPlugin extends Plugin {
                 Point target = overlayTargets.get(id);
                 Point loc = ov == null ? null : ov.getPreferredLocation();
                 Rectangle b = ov == null ? null : ov.getBounds();
-                log.info("[anchor-follow] overlay={} region={} tracked={} movable={} dragging={} target={} prefLoc={} bounds={}",
+                log.info("[anchor-follow] overlay={} region={} tracked={} movable={} dragging={} target={} prefLoc={} bounds={} layer={} prefPos={}",
                         id, a.getValue(), trackedOverlays.containsKey(id),
                         ov != null && ov.isMovable(), draggingIds.contains(id),
-                        target, loc, b);
+                        target, loc, b, ov == null ? null : ov.getLayer(),
+                        ov == null ? null : ov.getPreferredPosition());
             }
         }
 
@@ -2057,11 +2105,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                     boolean needsSeed = loc == null || !regionBounds.contains(loc);
                     if (needsSeed) {
                         setAbsoluteLocation(overlay, new Point(region.getX(), region.getY()));
-                        // Null position (not DYNAMIC) so the UNDER_WIDGETS->ABOVE_WIDGETS
-                        // promotion applies; the next snap tick's saveOverlay rebuilds layers.
-                        if (overlay.getPreferredPosition() != null) {
-                            overlay.setPreferredPosition(null);
-                        }
+                        // Layer policy (issue #19), applied in-memory only — the next snap
+                        // tick's applyLayerPolicy persists any change via saveOverlay.
+                        overlay.setPreferredPosition(config.drawAboveInterfaces() ? null : overlay.getPosition());
                         log.debug("Seeded overlay {} preferredLocation to region {} origin", overlayId, assignedRegionId);
                     }
                 }
