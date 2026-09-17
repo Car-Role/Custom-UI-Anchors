@@ -528,7 +528,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorAlignment.CENTER,
                 AnchorStacking.VERTICAL,
                 false,
-                0, 0, 0, 0);
+                0, 0, 0, 0,
+                AnchorFillDirection.FORWARD,
+                AnchorFillDirection.FORWARD);
         rebaselineOrigin(region);
 
         anchorRegions.add(region);
@@ -753,6 +755,8 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (r.getConstraint() == null) r.setConstraint(AnchorConstraint.TOP_LEFT);
             if (r.getAlignment() == null) r.setAlignment(AnchorAlignment.CENTER);
             if (r.getStacking() == null) r.setStacking(AnchorStacking.VERTICAL);
+            if (r.getFillDirection() == null) r.setFillDirection(AnchorFillDirection.FORWARD);
+            if (r.getWrapDirection() == null) r.setWrapDirection(AnchorFillDirection.FORWARD);
 
             // Defensive validation against corrupt/old config data
             if (r.getWidth() < 10) r.setWidth(10);
@@ -1580,6 +1584,17 @@ public class AnchorCustomizerPlugin extends Plugin {
             final int hAlign = hAlignCode(align);
             final int vAlign = vAlignCode(align);
 
+            // Fill + wrap directions (GitHub issue #24): REVERSE fill mirrors the order
+            // of items within each row (Fill-Horizontal) or column (Fill-Vertical);
+            // REVERSE wrap mirrors where successive rows/columns are added (rows grow
+            // bottom-to-top / columns right-to-left). Per-item cross alignment is NOT
+            // flipped — wrap direction mirrors the row/column position only. Both are
+            // ignored for plain VERTICAL/HORIZONTAL even if REVERSE is stored.
+            final boolean reverseFill = AnchorFillDirection.appliesTo(stacking)
+                    && region.getFillDirection() == AnchorFillDirection.REVERSE;
+            final boolean reverseWrap = AnchorFillDirection.appliesTo(stacking)
+                    && region.getWrapDirection() == AnchorFillDirection.REVERSE;
+
             // 1. First pass: lay items out along the stacking (main) axis and record each
             // item's size and, for fill modes, which row/column it landed in. Cross-axis
             // placement is deferred to pass 3 once group extents are known.
@@ -1707,12 +1722,20 @@ public class AnchorCustomizerPlugin extends Plugin {
                     case HORIZONTAL:
                         relY = crossAlignOffset(totalLayoutHeight, hs[i], vAlign);
                         break;
-                    case FILL_HORIZONTAL:
-                        relY = mainY[i] + crossAlignOffset(groupCross.getOrDefault(groupIdx[i], hs[i]), hs[i], vAlign);
+                    case FILL_HORIZONTAL: {
+                        int rowH = groupCross.getOrDefault(groupIdx[i], hs[i]);
+                        int rowY = reverseWrap ? mirror(mainY[i], totalLayoutHeight, rowH) : mainY[i];
+                        relX = reverseFill ? mirror(mainX[i], totalLayoutWidth, ws[i]) : mainX[i];
+                        relY = rowY + crossAlignOffset(rowH, hs[i], vAlign);
                         break;
-                    case FILL_VERTICAL:
-                        relX = mainX[i] + crossAlignOffset(groupCross.getOrDefault(groupIdx[i], ws[i]), ws[i], hAlign);
+                    }
+                    case FILL_VERTICAL: {
+                        int colW = groupCross.getOrDefault(groupIdx[i], ws[i]);
+                        int colX = reverseWrap ? mirror(mainX[i], totalLayoutWidth, colW) : mainX[i];
+                        relY = reverseFill ? mirror(mainY[i], totalLayoutHeight, hs[i]) : mainY[i];
+                        relX = colX + crossAlignOffset(colW, ws[i], hAlign);
                         break;
+                    }
                 }
 
                 int targetX = startX + relX;
@@ -1795,6 +1818,13 @@ public class AnchorCustomizerPlugin extends Plugin {
         final boolean horizontal = stacking == AnchorStacking.HORIZONTAL
                 || stacking == AnchorStacking.FILL_HORIZONTAL;
 
+        // When the region's fill direction reverses the main axis (issue #24), "first"
+        // in display order is the far end (rightmost for Fill-Horizontal, bottommost
+        // for Fill-Vertical) - sort descending so dropping an item at that end still
+        // earns index 0. Only the FILL_* modes have a fill direction.
+        final boolean mirroredMain = AnchorFillDirection.appliesTo(stacking)
+                && region.getFillDirection() == AnchorFillDirection.REVERSE;
+
         boolean anyHot = false;
         for (Overlay o : overlays) {
             String id = overlayKey(o);
@@ -1805,7 +1835,9 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         if (anyHot) {
-            overlays.sort((a, b) -> compareByPosition(a, b, horizontal));
+            overlays.sort((a, b) -> mirroredMain
+                    ? compareByPosition(b, a, horizontal)
+                    : compareByPosition(a, b, horizontal));
             for (int i = 0; i < overlays.size(); i++) {
                 String id = overlayKey(overlays.get(i));
                 if (id == null) continue;
@@ -1820,7 +1852,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         // Stable: seed any missing order (legacy data) once from current positions, then
         // sort by the persisted order.
-        seedMissingOrder(overlays, horizontal);
+        seedMissingOrder(overlays, horizontal, mirroredMain);
         overlays.sort((a, b) -> {
             int oa = orderOf(a);
             int ob = orderOf(b);
@@ -1849,7 +1881,7 @@ public class AnchorCustomizerPlugin extends Plugin {
      * order from current live positions. One-shot migration for configs saved before the
      * ordering feature existed.
      */
-    private void seedMissingOrder(List<Overlay> overlays, boolean horizontal) {
+    private void seedMissingOrder(List<Overlay> overlays, boolean horizontal, boolean mirroredMain) {
         boolean missing = false;
         for (Overlay o : overlays) {
             String id = overlayKey(o);
@@ -1860,7 +1892,9 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
         if (!missing) return;
         List<Overlay> sorted = new ArrayList<>(overlays);
-        sorted.sort((a, b) -> compareByPosition(a, b, horizontal));
+        sorted.sort((a, b) -> mirroredMain
+                ? compareByPosition(b, a, horizontal)
+                : compareByPosition(a, b, horizontal));
         for (int i = 0; i < sorted.size(); i++) {
             String id = overlayKey(sorted.get(i));
             if (id != null) {
@@ -1910,6 +1944,15 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (code == 0) return 0;
         if (code == 2) return extent - size;
         return (extent - size) / 2;
+    }
+
+    /**
+     * Mirror a leading-edge offset within a {@code total}-long layout block for the
+     * fill/wrap direction feature (GitHub issue #24): e.g. a 100-wide block, item at
+     * rel 0 with size 30 lands at 70 (its right edge flush with the block's right edge).
+     */
+    static int mirror(int rel, int total, int size) {
+        return total - rel - size;
     }
 
     /**

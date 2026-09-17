@@ -17,6 +17,7 @@ import java.awt.datatransfer.Transferable;
 import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
 import javax.swing.DropMode;
+import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
@@ -48,6 +49,10 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final ArrowGridPicker<AnchorConstraint> constraintPicker;
     private final ArrowGridPicker<AnchorAlignment> alignmentPicker;
     private final JComboBox<AnchorStacking> stackingComboBox;
+    private final JLabel fillLabel;
+    private final JComboBox<AnchorFillDirection> fillDirectionComboBox;
+    private final JLabel wrapLabel;
+    private final JComboBox<AnchorFillDirection> wrapDirectionComboBox;
 
     // Width of the clickable padlock zone at the right edge of each list row.
     private static final int LOCK_ZONE_WIDTH = 28;
@@ -242,8 +247,74 @@ public class AnchorCustomizerPanel extends PluginPanel {
         c.gridy++;
         stackingComboBox = new JComboBox<>(AnchorStacking.values());
         stackingComboBox.setToolTipText(stackingLabel.getToolTipText());
-        stackingComboBox.addActionListener(e -> saveChanges());
+        // Listener attached after fillDirectionComboBox is constructed below (the
+        // callback touches it, and a blank final can't be captured before assignment).
         propertiesPanel.add(stackingComboBox, c);
+
+        // Fill direction (GitHub issue #24): only shown for the wrapping fill modes.
+        c.gridy++;
+        fillLabel = new JLabel("Fill direction:");
+        fillLabel.setToolTipText(
+                "Which end of the box the first overlay is placed at when rows/columns wrap. "
+                        + "Fill-Horizontal: left to right or right to left. "
+                        + "Fill-Vertical: top to bottom or bottom to top.");
+        propertiesPanel.add(fillLabel, c);
+        c.gridy++;
+        fillDirectionComboBox = new JComboBox<>(AnchorFillDirection.values());
+        fillDirectionComboBox.setToolTipText(fillLabel.getToolTipText());
+        // The labels are axis-specific, so they follow whichever stacking mode is
+        // currently shown in the stacking combo.
+        fillDirectionComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public java.awt.Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                AnchorStacking s = (AnchorStacking) stackingComboBox.getSelectedItem();
+                setText(value instanceof AnchorFillDirection
+                        ? ((AnchorFillDirection) value).label(s != null ? s : AnchorStacking.FILL_HORIZONTAL)
+                        : "");
+                return this;
+            }
+        });
+        fillDirectionComboBox.addActionListener(e -> saveChanges());
+        propertiesPanel.add(fillDirectionComboBox, c);
+
+        // Wrap direction (GitHub issue #24): the cross axis — which way new
+        // rows/columns are added once the first is full. Same visibility rule.
+        c.gridy++;
+        wrapLabel = new JLabel("Wrap direction:");
+        wrapLabel.setToolTipText(
+                "Which way new rows/columns are added once the first one is full. "
+                        + "Fill-Horizontal: rows top to bottom or bottom to top. "
+                        + "Fill-Vertical: columns left to right or right to left.");
+        propertiesPanel.add(wrapLabel, c);
+        c.gridy++;
+        wrapDirectionComboBox = new JComboBox<>(AnchorFillDirection.values());
+        wrapDirectionComboBox.setToolTipText(wrapLabel.getToolTipText());
+        wrapDirectionComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public java.awt.Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                AnchorStacking s = (AnchorStacking) stackingComboBox.getSelectedItem();
+                setText(value instanceof AnchorFillDirection
+                        ? ((AnchorFillDirection) value).wrapLabel(s != null ? s : AnchorStacking.FILL_HORIZONTAL)
+                        : "");
+                return this;
+            }
+        });
+        wrapDirectionComboBox.addActionListener(e -> saveChanges());
+        propertiesPanel.add(wrapDirectionComboBox, c);
+
+        // Switching stacking mode flips the fill/wrap axis labels and may
+        // hide/show the controls entirely; refresh both before saving.
+        stackingComboBox.addActionListener(e -> {
+            if (isUpdating) return;
+            updateFillDirectionVisibility();
+            fillDirectionComboBox.repaint();
+            wrapDirectionComboBox.repaint();
+            saveChanges();
+        });
 
         // Position
         c.gridy++;
@@ -380,11 +451,31 @@ public class AnchorCustomizerPanel extends PluginPanel {
 
         stackingComboBox.setSelectedItem(
                 selectedRegion.getStacking() != null ? selectedRegion.getStacking() : AnchorStacking.VERTICAL);
+        fillDirectionComboBox.setSelectedItem(
+                selectedRegion.getFillDirection() != null ? selectedRegion.getFillDirection() : AnchorFillDirection.FORWARD);
+        wrapDirectionComboBox.setSelectedItem(
+                selectedRegion.getWrapDirection() != null ? selectedRegion.getWrapDirection() : AnchorFillDirection.FORWARD);
+        updateFillDirectionVisibility();
         isUpdating = false;
 
         propertiesPanel.setVisible(true);
         revalidate();
         repaint();
+    }
+
+    /**
+     * The fill-direction row only exists for the wrapping fill modes (GitHub issue
+     * #24); hide label and combo together for plain Vertical/Horizontal and revalidate
+     * so the grid collapses the empty row.
+     */
+    private void updateFillDirectionVisibility() {
+        AnchorStacking s = (AnchorStacking) stackingComboBox.getSelectedItem();
+        boolean show = AnchorFillDirection.appliesTo(s);
+        fillLabel.setVisible(show);
+        fillDirectionComboBox.setVisible(show);
+        wrapLabel.setVisible(show);
+        wrapDirectionComboBox.setVisible(show);
+        propertiesPanel.revalidate();
     }
 
     private void saveChanges() {
@@ -405,6 +496,10 @@ public class AnchorCustomizerPanel extends PluginPanel {
         AnchorAlignment picked = alignmentPicker.getSelectedValue();
         final AnchorAlignment newAlignment = picked != null ? picked : AnchorAlignment.CENTER;
         final AnchorStacking newStacking = (AnchorStacking) stackingComboBox.getSelectedItem();
+        AnchorFillDirection pickedFill = (AnchorFillDirection) fillDirectionComboBox.getSelectedItem();
+        final AnchorFillDirection newFillDirection = pickedFill != null ? pickedFill : AnchorFillDirection.FORWARD;
+        AnchorFillDirection pickedWrap = (AnchorFillDirection) wrapDirectionComboBox.getSelectedItem();
+        final AnchorFillDirection newWrapDirection = pickedWrap != null ? pickedWrap : AnchorFillDirection.FORWARD;
 
         plugin.updateRegion(selectedRegion, r -> {
             r.setName(newName);
@@ -415,6 +510,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setConstraint(finalConstraint);
             r.setAlignment(newAlignment);
             r.setStacking(newStacking);
+            r.setFillDirection(newFillDirection);
+            r.setWrapDirection(newWrapDirection);
         });
         regionList.repaint(); // Repaint list for name changes
     }

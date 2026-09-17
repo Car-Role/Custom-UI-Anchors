@@ -54,6 +54,18 @@ public class AnchorRegion {
     private volatile int originW;
     private volatile int originH;
 
+    // Which end of the box the first overlay is placed at when stacking wraps
+    // (GitHub issue #24). Only meaningful for the FILL_* stacking modes; stale
+    // "fillOrigin" keys from the abandoned corner-based design are ignored, and any
+    // null direction is treated as FORWARD everywhere.
+    private AnchorFillDirection fillDirection = AnchorFillDirection.FORWARD;
+
+    // Which way new rows/columns are added once the first is full when stacking wraps
+    // (FILL_* modes only): FORWARD = rows top->bottom / columns left->right, REVERSE =
+    // rows bottom->top / columns right->left. Legacy JSON gets FORWARD via the
+    // initializer; any null is treated as FORWARD everywhere.
+    private AnchorFillDirection wrapDirection = AnchorFillDirection.FORWARD;
+
     // Helper to get bounds as AWT Rectangle. Snapshots the four volatile fields in a
     // single call so callers get a self-consistent rectangle (still possible for x/y
     // vs width/height to be read across a drag update, but the worst case is a
@@ -89,6 +101,8 @@ public class AnchorRegion {
                 (int) Math.round(originX * fx),
                 (int) Math.round(originY * fy),
                 (int) Math.round(originW * fx),
-                (int) Math.round(originH * fy));
+                (int) Math.round(originH * fy),
+                fillDirection,
+                wrapDirection);
     }
 }
