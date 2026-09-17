@@ -54,6 +54,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final JComboBox<AnchorFillDirection> fillDirectionComboBox;
     private final JLabel wrapLabel;
     private final JComboBox<AnchorFillDirection> wrapDirectionComboBox;
+    private final JCheckBox enabledCheckBox;
     private final JCheckBox pinToChatCheckBox;
 
     // Width of the clickable padlock zone at the right edge of each list row.
@@ -318,6 +319,17 @@ public class AnchorCustomizerPanel extends PluginPanel {
             saveChanges();
         });
 
+        // Enabled toggle (GitHub issue #18): a disabled anchor is hidden and
+        // click-through on the canvas, and its overlays float free until re-enabled.
+        c.gridy++;
+        enabledCheckBox = new JCheckBox("Enabled");
+        enabledCheckBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        enabledCheckBox.setToolTipText(
+                "Uncheck to hide this anchor and release its overlays without losing their assignments — "
+                        + "re-enabling restores the previous layout.");
+        enabledCheckBox.addActionListener(e -> saveChanges());
+        propertiesPanel.add(enabledCheckBox, c);
+
         // Pin-to-chat toggle (GitHub issue #17)
         c.gridy++;
         pinToChatCheckBox = new JCheckBox("Pin vertically to chatbox");
@@ -469,6 +481,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
         wrapDirectionComboBox.setSelectedItem(
                 selectedRegion.getWrapDirection() != null ? selectedRegion.getWrapDirection() : AnchorFillDirection.FORWARD);
         updateFillDirectionVisibility();
+        enabledCheckBox.setSelected(!selectedRegion.isDisabled());
         pinToChatCheckBox.setSelected(selectedRegion.isPinToChat());
         isUpdating = false;
 
@@ -514,6 +527,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
         final AnchorFillDirection newFillDirection = pickedFill != null ? pickedFill : AnchorFillDirection.FORWARD;
         AnchorFillDirection pickedWrap = (AnchorFillDirection) wrapDirectionComboBox.getSelectedItem();
         final AnchorFillDirection newWrapDirection = pickedWrap != null ? pickedWrap : AnchorFillDirection.FORWARD;
+        final boolean newEnabled = enabledCheckBox.isSelected();
         final boolean newPinToChat = pinToChatCheckBox.isSelected();
 
         plugin.updateRegion(selectedRegion, r -> {
@@ -527,6 +541,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setStacking(newStacking);
             r.setFillDirection(newFillDirection);
             r.setWrapDirection(newWrapDirection);
+            r.setDisabled(!newEnabled);
             r.setPinToChat(newPinToChat);
         });
         regionList.repaint(); // Repaint list for name changes

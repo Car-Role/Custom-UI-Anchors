@@ -30,6 +30,11 @@ public interface AnchorCustomizerConfig extends Config {
         return true;
     }
 
+    @ConfigItem(keyName = "anchorVisibility", name = "Show anchors", description = "When anchor boxes are shown on the canvas: only while the drag hotkey is held, only while an overlay is being dragged, or never outside the side panel. Anchors are always shown (and editable) while this side panel is open.", position = 5)
+    default AnchorVisibility anchorVisibility() {
+        return AnchorVisibility.HOTKEY_HELD;
+    }
+
     @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "Log diagnostic details to the RuneLite client logs when you Alt+click an anchor. Only enable this if you're reproducing a drag/resize problem (e.g. with 117 HD) and sharing logs.", position = 2)
     default boolean debugLogging() {
         return false;

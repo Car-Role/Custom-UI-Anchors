@@ -103,6 +103,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     @Inject
     private Gson gson;
 
+    // Package-private for unit-test poking (same pattern as the seams below).
+    MouseButtonObserver buttonObserver = new MouseButtonObserver();
+
     // Test seams: unit tests substitute fakes; in production these delegate to the
     // injected OverlayManager (null in tests, so the delegates must be replaced before
     // the corresponding code paths run).
@@ -203,9 +206,46 @@ public class AnchorCustomizerPlugin extends Plugin {
     // Flag set by input listeners asking the next client tick to run an immediate snap.
     private volatile boolean needsSnap = false;
 
+    /**
+     * Whether the anchor boxes should be drawn (and pickable) right now. Anchors are
+     * always shown while the side panel is open; otherwise the {@code anchorVisibility}
+     * config decides (GitHub issue #18): while the drag hotkey is held, only while an
+     * overlay/anchor drag is in progress, or never outside the panel.
+     */
     public boolean isOverlaysVisible() {
-        boolean isPanelOpen = panel != null && panel.isShowing();
-        return isPanelOpen || isDragKeyHeld();
+        if (panel != null && panel.isShowing()) {
+            return true;
+        }
+        AnchorVisibility mode = config != null && config.anchorVisibility() != null
+                ? config.anchorVisibility() : AnchorVisibility.HOTKEY_HELD;
+        switch (mode) {
+            case PANEL_OPEN:
+                return false;
+            case WHILE_DRAGGING:
+                return hotkeyDown() && isOverlayHeld();
+            case HOTKEY_HELD:
+            default:
+                return hotkeyDown();
+        }
+    }
+
+    // Tracked flag OR live key state: the tracked flag misses a press made while keyboard
+    // focus was elsewhere (e.g. right after clicking the side panel), which hid the anchors
+    // while Alt was plainly held.
+    private boolean hotkeyDown() {
+        return isDragKeyHeld() || isDragHotkeyActive();
+    }
+
+    /**
+     * Whether a capturable overlay is physically held by the mouse right now: either our own
+     * pointer-on-UI drag, or a left-press (with the hotkey) that landed on movable UI and hasn't
+     * been released yet (RuneLite's OverlayRenderer drag). Movement timing is deliberately not
+     * used — pausing mid-drag must not hide the anchors, and overlays moved by other plugins
+     * must not show them.
+     */
+    public boolean isOverlayHeld() {
+        return (inputListener != null && inputListener.getDraggedOverlay() != null)
+                || buttonObserver.isOverlayGrabbed();
     }
 
     /**
@@ -321,6 +361,14 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         overlayManager.add(customizerOverlay);
+        // Index 0: RuneLite's OverlayRenderer consumes overlay-drag presses, and consumed
+        // events never reach later listeners — only an observer registered before it can
+        // reliably track the left button state (used to detect renderer-side drags).
+        buttonObserver.grabTest = e -> {
+            Overlay grabbed = isDragHotkeyActive(e) ? getMovableOverlayAt(e.getPoint()) : null;
+            return isCapturable(grabbed) ? grabbed : null;
+        };
+        mouseManager.registerMouseListener(0, buttonObserver);
         mouseManager.registerMouseListener(inputListener);
         anchorKeyListener.reset();
         // When the edit hotkey is released (or focus is lost), cancel any in-progress drag
@@ -380,6 +428,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Flush any pending persistence before tearing down
         flushPendingSaves(true);
         overlayManager.remove(customizerOverlay);
+        mouseManager.unregisterMouseListener(buttonObserver);
         mouseManager.unregisterMouseListener(inputListener);
         keyManager.unregisterKeyListener(anchorKeyListener);
         if (navButtonAdded) {
@@ -535,6 +584,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorStacking.VERTICAL,
                 false,
                 0, 0, 0, 0,
+                false,
                 AnchorFillDirection.FORWARD,
                 AnchorFillDirection.FORWARD,
                 false,
@@ -1539,7 +1589,12 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         Map<Integer, List<Overlay>> buckets = new HashMap<>();
         for (AnchorRegion r : regionsSnapshot) {
-            buckets.put(r.getId(), new ArrayList<>());
+            // Disabled regions hold no bucket: their assigned overlays float free (the
+            // maintenance pass below skips them), while assignments/order are retained
+            // so re-enabling the region restores the previous layout.
+            if (!r.isDisabled()) {
+                buckets.put(r.getId(), new ArrayList<>());
+            }
         }
 
         // --- CAPTURE PASS (hot overlays only) ---
@@ -1570,6 +1625,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
             boolean foundInRegion = false;
             for (AnchorRegion region : regionsSnapshot) {
+                if (region.isDisabled()) continue;
                 if (region.getBounds().contains(center)) {
                     if (assignedRegionId == null || !assignedRegionId.equals(region.getId())) {
                         overlayAssignments.put(overlayId, region.getId());
@@ -1592,8 +1648,13 @@ public class AnchorCustomizerPlugin extends Plugin {
                     alreadyBucketed.add(overlayId);
                 } else if (!isDraggingThis) {
                     // In grace window but not actively moving → this is the drop tick.
-                    // Commit the release.
-                    if (overlayAssignments.containsKey(overlayId)) {
+                    // Commit the release — unless the overlay belongs to a disabled box: a
+                    // disabled box keeps its assignments so re-enabling restores the layout,
+                    // and moving its (free-floating) UI meanwhile must not unlink it.
+                    AnchorRegion assignedRegion = regionById(regionsSnapshot, assignedRegionId);
+                    if (assignedRegion != null && assignedRegion.isDisabled()) {
+                        // keep assignment
+                    } else if (overlayAssignments.containsKey(overlayId)) {
                         // RuneLite's drag nulled preferredPosition (promoting the overlay above
                         // interfaces); honour the "Render over interfaces" setting for UI dragged
                         // out of a box too, not only while it's anchored.
@@ -1628,6 +1689,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         // Process buckets (Positioning logic)
         for (AnchorRegion region : regionsSnapshot) {
+            if (region.isDisabled()) continue;
             List<Overlay> overlays = buckets.get(region.getId());
 
             // Ghost-space fix: an overlay that is registered but currently rendering
@@ -1941,6 +2003,14 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
             return compareByPosition(a, b, horizontal);
         });
+    }
+
+    private static AnchorRegion regionById(List<AnchorRegion> regions, Integer id) {
+        if (id == null) return null;
+        for (AnchorRegion r : regions) {
+            if (r.getId() == id) return r;
+        }
+        return null;
     }
 
     private int compareByPosition(Overlay a, Overlay b, boolean horizontal) {

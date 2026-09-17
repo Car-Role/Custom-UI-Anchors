@@ -80,6 +80,9 @@ public class AnchorCustomizerOverlay extends Overlay {
         // stack: index 0 is drawn last and therefore renders on top of everything else.
         for (int i = regions.size() - 1; i >= 0; i--) {
             AnchorRegion region = regions.get(i);
+            if (region.isDisabled()) {
+                continue;
+            }
             boolean isDraggingThis = draggingAnchor != null && draggingAnchor.getId() == region.getId();
             boolean isHovering = hoverTarget != null && hoverTarget.getId() == region.getId();
 

@@ -40,6 +40,7 @@ public class AnchorInputListener implements MouseListener {
     // grab it (observed with 117 HD). Updating the overlay's preferredLocation is exactly what
     // OverlayRenderer's drag does, so the plugin's existing external-move detection backs the
     // snap off and runs capture/release on drop automatically.
+    @Getter
     private Overlay draggedOverlay = null;
     private int overlayGrabDx = 0;
     private int overlayGrabDy = 0;
@@ -82,6 +83,20 @@ public class AnchorInputListener implements MouseListener {
         }
 
         Point mousePos = e.getPoint();
+
+        // Anchors currently hidden by the visibility mode (GitHub issue #18): skip the
+        // anchor drag/resize branch entirely, but still run the pointer-on-UI overlay
+        // drag so overlays remain draggable — and once one starts, the anchors appear
+        // (WHILE_DRAGGING mode) so the user can see where they're dropping it.
+        if (!plugin.isOverlaysVisible()) {
+            Overlay hiddenOverlay = plugin.getMovableOverlayAt(mousePos);
+            if (hiddenOverlay != null) {
+                beginOverlayDrag(hiddenOverlay, mousePos);
+                e.consume();
+            }
+            return e;
+        }
+
         AnchorRegion region = pickAnchorByClickCount(mousePos, e.getClickCount());
         if (region == null) {
             return e;
@@ -320,7 +335,7 @@ public class AnchorInputListener implements MouseListener {
     private List<AnchorRegion> pickAnchorsAt(Point p) {
         List<AnchorRegion> hits = new ArrayList<>();
         for (AnchorRegion r : plugin.getAnchorRegions()) {
-            if (r.isLocked()) {
+            if (r.isLocked() || r.isDisabled()) {
                 continue;
             }
             Rectangle b = r.getBounds();
@@ -347,7 +362,7 @@ public class AnchorInputListener implements MouseListener {
      */
     public AnchorRegion pickTopAnchorAt(Point p, List<AnchorRegion> regions) {
         for (AnchorRegion r : regions) {
-            if (r.isLocked()) {
+            if (r.isLocked() || r.isDisabled()) {
                 continue;
             }
             Rectangle b = r.getBounds();
@@ -392,6 +407,11 @@ public class AnchorInputListener implements MouseListener {
             // Not in edit mode: clear any stale move/resize cursor by restoring the ClientUI
             // baseline (the Custom Cursor plugin's cursor if one is set, else the arrow).
             clientUI.setCursor(clientUI.getDefaultCursor());
+            return e;
+        }
+
+        // Anchors hidden by the visibility mode (issue #18): no anchor hover cursors.
+        if (!plugin.isOverlaysVisible()) {
             return e;
         }
 

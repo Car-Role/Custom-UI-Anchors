@@ -54,6 +54,13 @@ public class AnchorRegion {
     private volatile int originW;
     private volatile int originH;
 
+    // Stored INVERTED (disabled, not enabled) so that legacy persisted data missing the
+    // field deserializes to false = enabled (Gson yields false for absent booleans).
+    // A disabled anchor is not rendered, not pickable on the canvas, and skipped by the
+    // snap pass — its overlays float free — but assignments/order are retained so
+    // re-enabling restores everything, and it stays listed/editable in the panel.
+    private volatile boolean disabled = false;
+
     // Which end of the box the first overlay is placed at when stacking wraps
     // (GitHub issue #24). Only meaningful for the FILL_* stacking modes; stale
     // "fillOrigin" keys from the abandoned corner-based design are ignored, and any
@@ -111,6 +118,7 @@ public class AnchorRegion {
                 (int) Math.round(originY * fy),
                 (int) Math.round(originW * fx),
                 (int) Math.round(originH * fy),
+                disabled,
                 fillDirection,
                 wrapDirection,
                 pinToChat,
