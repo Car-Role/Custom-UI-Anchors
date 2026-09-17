@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
@@ -104,6 +105,7 @@ public class AnchorCustomizerPlugin extends Plugin {
     // the corresponding code paths run).
     Consumer<Overlay> resetOverlayHandler = o -> overlayManager.resetOverlay(o);
     Consumer<Overlay> saveOverlayHandler = o -> overlayManager.saveOverlay(o);
+    Consumer<Predicate<Overlay>> overlayScanHandler = p -> overlayManager.anyMatch(p);
 
     // Package-private for unit tests.
     final List<AnchorRegion> anchorRegions = new ArrayList<>();
@@ -1467,8 +1469,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         for (String overlayId : hotIds) {
             Overlay overlay = trackedOverlays.get(overlayId);
             if (overlay == null) overlay = movableOverlayByKey.get(overlayId);
-            if (overlay == null || overlay == customizerOverlay) continue;
-            if (!overlay.isMovable() || overlay.getPreferredLocation() == null) continue;
+            if (overlay == null || overlay == customizerOverlay || !isCapturable(overlay)) continue;
+            if (overlay.getPreferredLocation() == null) continue;
 
             Rectangle overlayBounds = overlay.getBounds();
             if (overlayBounds.isEmpty()) {
@@ -1910,6 +1912,29 @@ public class AnchorCustomizerPlugin extends Plugin {
         return (extent - size) / 2;
     }
 
+    /**
+     * Whether this overlay may be captured into / managed by an anchor region
+     * (GitHub issue #22). Excludes nulls, non-movable overlays, and RuneLite's Screen
+     * Marker overlay (matched by FQN so we need no compile-time dependency on the
+     * screenmarkers plugin, which may be disabled): screen markers are user-drawn
+     * rectangles that must never be stacked or assigned, though they remain
+     * alt-draggable via the pointer-on-UI rule in {@link #getMovableOverlayAt}.
+     */
+    private static boolean isCapturable(Overlay o) {
+        if (o == null || !o.isMovable()) {
+            return false;
+        }
+        String cls = o.getClass().getName();
+        return !SCREEN_MARKER_OVERLAY_FQN.equals(cls) && !SNAP_CORNER_OVERLAY_FQN.equals(cls);
+    }
+
+    private static final String SCREEN_MARKER_OVERLAY_FQN =
+            "net.runelite.client.plugins.screenmarkers.ScreenMarkerOverlay";
+    // RuneLite's own snap-corner anchors (added as movable overlays while the drag hotkey is
+    // held, 1.12.39+). They are anchors themselves and must never be captured into a box.
+    private static final String SNAP_CORNER_OVERLAY_FQN =
+            "net.runelite.client.ui.overlay.SnapCorner$CornerOverlay";
+
     private void loadOverlayOrder() {
         String json = config.overlayOrderJson();
         if (json == null || json.isEmpty()) {
@@ -1995,7 +2020,7 @@ public class AnchorCustomizerPlugin extends Plugin {
      * This is the entry point for tracking overlays without reflection.
      */
     public void onOverlayDragged(Overlay overlay) {
-        if (overlay == null || !overlay.isMovable() || overlay == customizerOverlay)
+        if (overlay == null || overlay == customizerOverlay || !isCapturable(overlay))
             return;
 
         String overlayId = overlayKey(overlay);
@@ -2083,8 +2108,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Use anyMatch to scan through overlays and capture references
         // The predicate has a side-effect of storing references, but always returns false
         // so we scan ALL overlays
-        overlayManager.anyMatch(overlay -> {
-            if (overlay == null || !overlay.isMovable() || overlay == customizerOverlay) {
+        overlayScanHandler.accept(overlay -> {
+            if (overlay == null || overlay == customizerOverlay || !isCapturable(overlay)) {
                 return false;
             }
 
@@ -2136,10 +2161,10 @@ public class AnchorCustomizerPlugin extends Plugin {
         movableOverlayByKey.clear();
         final long now = System.currentTimeMillis();
 
-        overlayManager.anyMatch(ov -> {
+        overlayScanHandler.accept(ov -> {
             if (ov == null) return false;
             present.add(ov);
-            if (ov == customizerOverlay || !ov.isMovable()) return false;
+            if (ov == customizerOverlay || !isCapturable(ov)) return false;
 
             String id = overlayKey(ov);
             if (id == null) return false;
