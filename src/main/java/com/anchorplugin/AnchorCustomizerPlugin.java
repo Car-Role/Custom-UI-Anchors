@@ -32,6 +32,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
@@ -40,6 +41,8 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.ClientTick;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -106,6 +109,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     Consumer<Overlay> resetOverlayHandler = o -> overlayManager.resetOverlay(o);
     Consumer<Overlay> saveOverlayHandler = o -> overlayManager.saveOverlay(o);
     Consumer<Predicate<Overlay>> overlayScanHandler = p -> overlayManager.anyMatch(p);
+
+    // Chatbox-top supplier for the pin-to-chat feature; tests inject a fixed value.
+    Supplier<Integer> chatTopSupplier = this::getChatTopY;
 
     // Package-private for unit tests.
     final List<AnchorRegion> anchorRegions = new ArrayList<>();
@@ -530,7 +536,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                 false,
                 0, 0, 0, 0,
                 AnchorFillDirection.FORWARD,
-                AnchorFillDirection.FORWARD);
+                AnchorFillDirection.FORWARD,
+                false,
+                0);
         rebaselineOrigin(region);
 
         anchorRegions.add(region);
@@ -637,6 +645,43 @@ public class AnchorCustomizerPlugin extends Plugin {
         region.setOriginY(region.getY());
         region.setOriginW(w);
         region.setOriginH(h);
+        // Seed the chatbox-top baseline alongside the canvas origin so pinToChat regions
+        // measure chat open/close deltas from the user's confirmed position.
+        Integer ct = chatTopSupplier.get();
+        if (ct != null) {
+            region.setOriginChatTop(ct);
+        }
+    }
+
+    /**
+     * The chatbox's top edge in absolute canvas coordinates, or null when the chat
+     * container widget isn't available yet. Mirrors RuneLite's own CHATBOX_TOP origin
+     * computation (OverlayManager.convertOriginToAbsolute): the chat container bounds
+     * for the active top-level interface, pushed down by the chat area's height while
+     * the chatbox is hidden. Client-thread only.
+     */
+    private Integer getChatTopY() {
+        Widget chatContainer = client.isResized()
+                ? (client.getTopLevelInterfaceId() == InterfaceID.TOPLEVEL_PRE_EOC
+                        ? client.getWidget(InterfaceID.ToplevelPreEoc.CHAT_CONTAINER)
+                        : client.getWidget(InterfaceID.ToplevelOsrsStretch.CHAT_CONTAINER))
+                : client.getWidget(InterfaceID.Toplevel.CHAT_CONTAINER);
+        if (chatContainer == null) {
+            return null;
+        }
+        Rectangle bounds = chatContainer.getBounds();
+        if (bounds == null || bounds.isEmpty()) {
+            return null;
+        }
+        int chatTop = bounds.y;
+        Widget chatArea = client.getWidget(InterfaceID.Chatbox.CHATAREA);
+        if (chatArea != null && chatArea.isSelfHidden()) {
+            Rectangle areaBounds = chatArea.getBounds();
+            if (areaBounds != null) {
+                chatTop += areaBounds.height;
+            }
+        }
+        return chatTop;
     }
 
     /**
@@ -717,7 +762,32 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         region.setX(region.getOriginX() + xShift);
+
+        // Pin-to-chat (GitHub issue #17): vertical position tracks the chatbox top
+        // instead of the window constraint. X still follows the constraint above.
+        if (region.isPinToChat()) {
+            Integer ct = chatTopSupplier.get();
+            if (ct == null) {
+                // Chat widget unavailable this tick — keep the current y.
+                return;
+            }
+            if (region.getOriginChatTop() == 0) {
+                // Lazy seed, like the legacy origin fields: anchor at the current chat
+                // top so the first pinned tick is a no-op.
+                region.setOriginChatTop(ct);
+                region.setY(region.getOriginY());
+                return;
+            }
+            region.setY(region.getOriginY() + chatPinnedYShift(region.getOriginChatTop(), ct));
+            return;
+        }
+
         region.setY(region.getOriginY() + yShift);
+    }
+
+    /** Vertical shift for a chat-pinned region: how far the chatbox top has moved since the origin snapshot. */
+    static int chatPinnedYShift(int originChatTop, int currentChatTop) {
+        return currentChatTop - originChatTop;
     }
 
     private void loadRegions() {
@@ -1160,6 +1230,16 @@ public class AnchorCustomizerPlugin extends Plugin {
                         isResizingWindow = true;
                         lastResizeTime = System.currentTimeMillis();
                         markRegionsDirty();
+                    } else {
+                        // Chat-pinned regions track the chatbox top, which moves without
+                        // any canvas resize (chat opening/closing) — recompute them every
+                        // tick so they follow it. Not persisted: the shift is transient.
+                        for (AnchorRegion region : new ArrayList<>(anchorRegions)) {
+                            if (region == dragged) continue;
+                            if (region.isPinToChat()) {
+                                recomputePosition(region, currentDim);
+                            }
+                        }
                     }
                 }
                 lastViewport = currentDim;

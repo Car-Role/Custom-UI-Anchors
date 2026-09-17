@@ -19,6 +19,7 @@ import javax.swing.DefaultListModel;
 import javax.swing.DropMode;
 import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -53,6 +54,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final JComboBox<AnchorFillDirection> fillDirectionComboBox;
     private final JLabel wrapLabel;
     private final JComboBox<AnchorFillDirection> wrapDirectionComboBox;
+    private final JCheckBox pinToChatCheckBox;
 
     // Width of the clickable padlock zone at the right edge of each list row.
     private static final int LOCK_ZONE_WIDTH = 28;
@@ -316,6 +318,17 @@ public class AnchorCustomizerPanel extends PluginPanel {
             saveChanges();
         });
 
+        // Pin-to-chat toggle (GitHub issue #17)
+        c.gridy++;
+        pinToChatCheckBox = new JCheckBox("Pin vertically to chatbox");
+        pinToChatCheckBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        pinToChatCheckBox.setToolTipText(
+                "The box moves up and down with the top of the chatbox, so it stays above the chat when it "
+                        + "opens/closes (like RuneLite's own above-chat anchors). Horizontal position still "
+                        + "follows the constraint.");
+        pinToChatCheckBox.addActionListener(e -> saveChanges());
+        propertiesPanel.add(pinToChatCheckBox, c);
+
         // Position
         c.gridy++;
         JPanel posPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -456,6 +469,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
         wrapDirectionComboBox.setSelectedItem(
                 selectedRegion.getWrapDirection() != null ? selectedRegion.getWrapDirection() : AnchorFillDirection.FORWARD);
         updateFillDirectionVisibility();
+        pinToChatCheckBox.setSelected(selectedRegion.isPinToChat());
         isUpdating = false;
 
         propertiesPanel.setVisible(true);
@@ -500,6 +514,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
         final AnchorFillDirection newFillDirection = pickedFill != null ? pickedFill : AnchorFillDirection.FORWARD;
         AnchorFillDirection pickedWrap = (AnchorFillDirection) wrapDirectionComboBox.getSelectedItem();
         final AnchorFillDirection newWrapDirection = pickedWrap != null ? pickedWrap : AnchorFillDirection.FORWARD;
+        final boolean newPinToChat = pinToChatCheckBox.isSelected();
 
         plugin.updateRegion(selectedRegion, r -> {
             r.setName(newName);
@@ -512,6 +527,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setStacking(newStacking);
             r.setFillDirection(newFillDirection);
             r.setWrapDirection(newWrapDirection);
+            r.setPinToChat(newPinToChat);
         });
         regionList.repaint(); // Repaint list for name changes
     }

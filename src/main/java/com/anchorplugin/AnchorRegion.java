@@ -66,6 +66,15 @@ public class AnchorRegion {
     // initializer; any null is treated as FORWARD everywhere.
     private AnchorFillDirection wrapDirection = AnchorFillDirection.FORWARD;
 
+    // When true, the box's vertical position tracks the top of the chatbox instead of the
+    // window constraint, so it rides up/down as the chat opens and closes (GitHub issue #17).
+    private volatile boolean pinToChat = false;
+
+    // Chatbox top (absolute canvas Y) captured at the same time as the origin snapshot.
+    // 0 = not seeded yet; the recompute path seeds it lazily on the first tick the chat
+    // widget is available, like the legacy origin fields.
+    private volatile int originChatTop = 0;
+
     // Helper to get bounds as AWT Rectangle. Snapshots the four volatile fields in a
     // single call so callers get a self-consistent rectangle (still possible for x/y
     // vs width/height to be read across a drag update, but the worst case is a
@@ -103,6 +112,8 @@ public class AnchorRegion {
                 (int) Math.round(originW * fx),
                 (int) Math.round(originH * fy),
                 fillDirection,
-                wrapDirection);
+                wrapDirection,
+                pinToChat,
+                (int) Math.round(originChatTop * fy));
     }
 }
