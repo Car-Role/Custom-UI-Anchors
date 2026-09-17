@@ -249,15 +249,66 @@ public class AnchorInputListener implements MouseListener {
         return e;
     }
 
+    // The cursor that was showing before we put up an anchor move/resize cursor, or null while
+    // we aren't overriding it. AWT thread only.
+    private Cursor cursorBeforeOverride = null;
+
+    /** Show an anchor move/resize cursor, remembering the cursor it replaces the first time. */
+    private void showAnchorCursor(Cursor cursor) {
+        if (cursorBeforeOverride == null) {
+            cursorBeforeOverride = clientUI.getCurrentCursor();
+        }
+        clientUI.setCursor(cursor);
+    }
+
     /**
-     * Restore the cursor to RuneLite's current baseline via {@link ClientUI}. When the Custom
-     * Cursor plugin is active this is the user's custom cursor (ClientUI tracks it as the
-     * "default"); otherwise it is the system arrow. Routing through ClientUI — exactly like
-     * RuneLite's own OverlayRenderer — and never setting a cursor on the game canvas directly
-     * is what stops us from stranding the custom cursor (GitHub: custom cursor disabled on Alt).
+     * Undo our anchor move/resize cursor, restoring whatever cursor was showing before it.
+     * No-op when we haven't changed the cursor: other plugins set their own cursor through
+     * ClientUI (e.g. Crosshair Cursor, GitHub issue #26), and resetting it on every hotkey
+     * release / focus loss / mouse move clobbered theirs. Everything goes through ClientUI —
+     * never the game canvas — so the Custom Cursor plugin's cursor isn't stranded either.
      */
     public void resetCursorToDefault() {
-        clientUI.setCursor(clientUI.getDefaultCursor());
+        if (cursorBeforeOverride == null) {
+            return;
+        }
+        Cursor restore = cursorBeforeOverride;
+        cursorBeforeOverride = null;
+        // If the remembered cursor was itself a transient move/resize cursor (e.g. RuneLite's
+        // overlay renderer had one up), fall back to the ClientUI baseline instead.
+        if (restore == null || isEditCursor(restore)) {
+            restore = clientUI.getDefaultCursor();
+        }
+        clientUI.setCursor(restore);
+    }
+
+    // The cursor showing when the drag hotkey went down (e.g. Crosshair Cursor's), or null.
+    private volatile Cursor cursorBeforeHotkey = null;
+
+    /** Hotkey pressed: remember the cursor so it can be put back when the hotkey is released. */
+    public void rememberCursorForHotkey() {
+        Cursor c = clientUI.getCurrentCursor();
+        cursorBeforeHotkey = (c == null || isEditCursor(c)) ? null : c;
+    }
+
+    /**
+     * Hotkey released (or focus lost): put back the cursor from before the hotkey went down.
+     * While the drag hotkey is held, RuneLite's own OverlayRenderer resets the cursor to the
+     * ClientUI default on mouse moves and again on release, which wiped cursors other plugins
+     * set through ClientUI (Crosshair Cursor, GitHub issue #26). Our key listener runs after
+     * RuneLite's hotkey listener, so restoring here lands after that reset.
+     */
+    public void restoreCursorAfterHotkey() {
+        Cursor c = cursorBeforeHotkey;
+        cursorBeforeHotkey = null;
+        if (c != null) {
+            clientUI.setCursor(c);
+        }
+    }
+
+    private static boolean isEditCursor(Cursor c) {
+        int t = c.getType();
+        return t == Cursor.MOVE_CURSOR || (t >= Cursor.SW_RESIZE_CURSOR && t <= Cursor.E_RESIZE_CURSOR);
     }
 
     /**
@@ -406,9 +457,8 @@ public class AnchorInputListener implements MouseListener {
             return e;
         }
         if (!hotkeyActive) {
-            // Not in edit mode: clear any stale move/resize cursor by restoring the ClientUI
-            // baseline (the Custom Cursor plugin's cursor if one is set, else the arrow).
-            clientUI.setCursor(clientUI.getDefaultCursor());
+            // Not in edit mode: clear any stale move/resize cursor we put up.
+            resetCursorToDefault();
             return e;
         }
 
@@ -432,12 +482,12 @@ public class AnchorInputListener implements MouseListener {
         AnchorRegion hover = pickTopAnchorAt(e.getPoint());
         if (hover != null) {
             int dir = getResizeDirection(hover.getBounds(), e.getPoint());
-            clientUI.setCursor(getCursorForDirection(dir));
+            showAnchorCursor(getCursorForDirection(dir));
             return e;
         }
 
-        // Not over any region: restore the ClientUI baseline cursor.
-        clientUI.setCursor(clientUI.getDefaultCursor());
+        // Not over any region: undo our move/resize cursor, if any.
+        resetCursorToDefault();
         return e;
     }
 

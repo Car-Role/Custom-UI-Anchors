@@ -131,6 +131,9 @@ public class AnchorKeyListener implements KeyListener {
     // stationary mouse on Alt-release can't strand the move/resize cursor.
     private volatile Runnable onReleased;
 
+    // Invoked on the AWT event thread when the hotkey goes down (not on key-repeat).
+    private volatile Runnable onPressed;
+
     @Inject
     AnchorKeyListener(RuneLiteConfig runeLiteConfig, Client client) {
         this.runeLiteConfig = runeLiteConfig;
@@ -139,6 +142,10 @@ public class AnchorKeyListener implements KeyListener {
 
     public void setOnReleased(Runnable onReleased) {
         this.onReleased = onReleased;
+    }
+
+    public void setOnPressed(Runnable onPressed) {
+        this.onPressed = onPressed;
     }
 
     /**
@@ -253,7 +260,12 @@ public class AnchorKeyListener implements KeyListener {
     @Override
     public void keyPressed(KeyEvent e) {
         if (dragHotkey().matches(e)) {
+            boolean wasHeld = held;
             held = true;
+            Runnable r = onPressed;
+            if (!wasHeld && r != null) {
+                r.run();
+            }
         }
     }
 

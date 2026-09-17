@@ -394,7 +394,9 @@ public class AnchorCustomizerPlugin extends Plugin {
         anchorKeyListener.setOnReleased(() -> {
             inputListener.cancelDrag();
             inputListener.resetCursorToDefault();
+            inputListener.restoreCursorAfterHotkey();
         });
+        anchorKeyListener.setOnPressed(inputListener::rememberCursorForHotkey);
         keyManager.registerKeyListener(anchorKeyListener);
         // One-time heal for in-place upgrades: older builds set an explicit cursor directly
         // on the game canvas, which overrode the Custom Cursor plugin's cursor (set on the
