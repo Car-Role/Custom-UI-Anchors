@@ -149,9 +149,11 @@ public class AnchorInputListener implements MouseListener {
         }
         overlayGrabDx = mousePos.x - loc.x;
         overlayGrabDy = mousePos.y - loc.y;
-        if (overlay.getPreferredPosition() != null) {
-            overlay.setPreferredPosition(null);
-        }
+        // mouseDragged writes ABSOLUTE locations, so the overlay must be on a LEFT/TOP origin
+        // first. An unanchored overlay keeps whatever RIGHT/CENTER/BOTTOM origin RuneLite gave
+        // it on its last drop; writing absolute coords into that origin threw it off-screen
+        // (clamped into the bottom-right corner, where another anchor then captured it).
+        plugin.prepareForManualDrag(overlay, loc);
     }
 
     @Override
