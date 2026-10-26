@@ -407,6 +407,32 @@ public class AnchorFeaturesTest {
     }
 
     @Test
+    public void tiedOrderUnderReverseFillIsAFixedPoint() {
+        // Issue #21: two resting items with the same persisted order index in a Reverse
+        // Fill-Horizontal row. Lay them out from their current bounds and check that the
+        // result reproduces those bounds, i.e. they no longer swap every tick.
+        Rectangle a = new Rectangle(618, 626, 107, 35);
+        Rectangle b = new Rectangle(727, 626, 35, 35);
+        int regionX = 618, padding = 2;
+
+        boolean aFirst = AnchorCustomizerPlugin.compareResting(1, 1, a, b, true, true) < 0;
+        Rectangle first = aFirst ? a : b;
+        Rectangle second = aFirst ? b : a;
+        int total = first.width + padding + second.width;
+        // Reverse fill mirrors main-axis positions within the row.
+        int firstX = regionX + (total - 0 - first.width);
+        int secondX = regionX + (total - (first.width + padding) - second.width);
+
+        assertEquals(first.x, firstX);
+        assertEquals(second.x, secondX);
+
+        // Forward fill keeps the plain left-to-right tie-break.
+        assertTrue(AnchorCustomizerPlugin.compareResting(1, 1, a, b, true, false) < 0);
+        // A real order difference always wins over position.
+        assertTrue(AnchorCustomizerPlugin.compareResting(0, 1, b, a, true, true) < 0);
+    }
+
+    @Test
     public void shouldDeferApplyOnlyForUnnormalizedDuringExternalDrag() {
         AtomicInteger resets = new AtomicInteger();
         AtomicInteger saves = new AtomicInteger();

@@ -2189,18 +2189,24 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Stable: seed any missing order (legacy data) once from current positions, then
         // sort by the persisted order.
         seedMissingOrder(resting, horizontal, mirroredMain);
-        resting.sort((a, b) -> {
-            int oa = orderOf(a);
-            int ob = orderOf(b);
-            if (oa != ob) {
-                return Integer.compare(oa, ob);
-            }
-            return compareByPosition(a, b, horizontal);
-        });
+        resting.sort((a, b) -> compareResting(orderOf(a), orderOf(b), a.getBounds(), b.getBounds(),
+                horizontal, mirroredMain));
 
         if (moving.isEmpty()) {
             overlays.clear();
             overlays.addAll(resting);
+            // Two resting overlays sharing an order index (left over from different bucket
+            // contents) were tie-broken by live position every tick, which made them swap
+            // places each frame under Reverse fill (GitHub issue #21). Persist the resolved
+            // order once so the tie, and the position dependence, go away.
+            if (hasDuplicateOrder(resting)) {
+                for (int i = 0; i < resting.size(); i++) {
+                    String id = overlayKey(resting.get(i));
+                    if (id == null) continue;
+                    overlayOrder.put(id, i);
+                    orderDirty = true;
+                }
+            }
             return;
         }
 
@@ -2271,6 +2277,29 @@ public class AnchorCustomizerPlugin extends Plugin {
             default:
                 return r.getCenterY() < cy;
         }
+    }
+
+    /**
+     * Resting-overlay order: persisted index first; ties fall back to position in the
+     * region's reading order, which is right-to-left (or bottom-to-top) under Reverse fill.
+     * Breaking ties left-to-right regardless of fill direction made a Reverse layout put the
+     * winner at the far end, flipping the comparison every tick (GitHub issue #21).
+     */
+    static int compareResting(int orderA, int orderB, Rectangle boundsA, Rectangle boundsB,
+                              boolean horizontal, boolean mirroredMain) {
+        if (orderA != orderB) {
+            return Integer.compare(orderA, orderB);
+        }
+        int byPos = horizontal ? Integer.compare(boundsA.x, boundsB.x) : Integer.compare(boundsA.y, boundsB.y);
+        return mirroredMain ? -byPos : byPos;
+    }
+
+    private boolean hasDuplicateOrder(List<Overlay> overlays) {
+        Set<Integer> seen = new HashSet<>();
+        for (Overlay o : overlays) {
+            if (overlayKey(o) != null && !seen.add(orderOf(o))) return true;
+        }
+        return false;
     }
 
     private int compareByPosition(Overlay a, Overlay b, boolean horizontal) {
