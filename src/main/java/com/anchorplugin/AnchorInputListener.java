@@ -69,13 +69,19 @@ public class AnchorInputListener implements MouseListener {
         final boolean hotkeyActive = plugin.isDragHotkeyActive(e);
 
         AnchorCustomizerConfig cfg = plugin.getConfig();
-        if (cfg != null && cfg.debugLogging() && SwingUtilities.isLeftMouseButton(e)
-                && (hotkeyActive || e.isAltDown() || plugin.isDragKeyHeld())) {
+        if (SwingUtilities.isLeftMouseButton(e) && (hotkeyActive || e.isAltDown() || plugin.isDragKeyHeld())) {
             Point dp = e.getPoint();
             Overlay dbgOverlay = plugin.getMovableOverlayAt(dp);
-            log.info("[anchor-debug] mousePressed hotkeyLive={} trackedHeld={} overlaysVisible={} altDown={} at=({},{}) topRegion={} overlay={}",
-                    hotkeyActive, plugin.isDragKeyHeld(), plugin.isOverlaysVisible(), e.isAltDown(),
-                    dp.x, dp.y, regionLabel(pickTopAnchorAt(dp)), dbgOverlay == null ? "none" : dbgOverlay.getName());
+            String overlayName = dbgOverlay == null ? "none" : dbgOverlay.getName();
+            String region = regionLabel(pickTopAnchorAt(dp));
+            plugin.events.add("Hotkey click at " + dp.x + "," + dp.y + ": anchor=" + region + " overlay=" + overlayName
+                    + " hotkeyLive=" + hotkeyActive + " trackedHeld=" + plugin.isDragKeyHeld()
+                    + " altDown=" + e.isAltDown() + " anchorsVisible=" + plugin.isOverlaysVisible());
+            if (cfg != null && cfg.debugLogging()) {
+                log.info("[anchor-debug] mousePressed hotkeyLive={} trackedHeld={} overlaysVisible={} altDown={} at=({},{}) topRegion={} overlay={}",
+                        hotkeyActive, plugin.isDragKeyHeld(), plugin.isOverlaysVisible(), e.isAltDown(),
+                        dp.x, dp.y, region, overlayName);
+            }
         }
 
         if (!hotkeyActive || SwingUtilities.isRightMouseButton(e)) {

@@ -8,6 +8,7 @@
 package com.anchorplugin;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 // Gson parameterized-type helpers — used only for JSON (de)serialization of our
@@ -15,8 +16,13 @@ import com.google.gson.JsonObject;
 import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
 import java.awt.Dimension;
+import java.awt.Frame;
+import java.awt.GraphicsDevice;
+import java.awt.GraphicsEnvironment;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.awt.Window;
+import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.lang.reflect.InvocationTargetException;
 // java.lang.reflect.Type is the interface returned by TypeToken#getType(); still
@@ -28,9 +34,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -47,20 +55,28 @@ import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.Player;
+import net.runelite.client.RuneLite;
+import net.runelite.client.RuneLiteProperties;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+import net.runelite.client.externalplugins.PluginHubManifest;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
 
 @Slf4j
 @PluginDescriptor(name = "Custom UI Anchors", description = "Visualize and customize overlay anchor positions. Alt+drag to move anchor points.", tags = {
@@ -99,6 +115,18 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     @Inject
     private ClientThread clientThread;
+
+    @Inject
+    private PluginManager pluginManager;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private RuneLiteConfig runeLiteConfig;
+
+    // Recent events for the diagnostics report. Always on and bounded; see DiagnosticEvents.
+    final DiagnosticEvents events = new DiagnosticEvents(250);
 
     private AnchorCustomizerPanel panel;
     private NavigationButton navButton;
@@ -420,6 +448,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Try to re-acquire overlay references for persisted assignments
         scanAndReacquireOverlays();
         lastReacquireTime = System.currentTimeMillis();
+        events.add("Plugin started: " + anchorRegions.size() + " anchors, " + overlayAssignments.size()
+                + " assigned overlays, " + profileLayouts.size() + " stored layout profiles");
 
         // Update panel and restore the last-selected region (Fix SEL).
         final List<AnchorRegion> snapshot = new ArrayList<>(anchorRegions);
@@ -446,6 +476,7 @@ public class AnchorCustomizerPlugin extends Plugin {
     protected void shutDown() throws Exception {
         // Flush any pending persistence before tearing down
         flushPendingSaves(true);
+        events.add("Plugin stopped");
         overlayManager.remove(customizerOverlay);
         mouseManager.unregisterMouseListener(buttonObserver);
         mouseManager.unregisterMouseListener(inputListener);
@@ -469,6 +500,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     public void onConfigChanged(ConfigChanged event) {
         if (!event.getGroup().equals("anchorcustomizer")) {
             return;
+        }
+        if (!INTERNAL_CONFIG_KEYS.contains(event.getKey())) {
+            events.add("Setting changed: " + event.getKey() + " = " + event.getNewValue());
         }
 
         if (event.getKey().equals("regionJson")) {
@@ -613,6 +647,7 @@ public class AnchorCustomizerPlugin extends Plugin {
 
         anchorRegions.add(region);
         markRegionsDirty();
+        events.add("Created anchor " + nextId + " at " + x + "," + y);
         selectAnchor(region);
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
         SwingUtilities.invokeLater(() -> panel.updateList(snap));
@@ -652,6 +687,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (removedAny) {
                 markAssignmentsDirty();
             }
+            events.add("Deleted anchor " + deletedId);
             saveRegions();
             selectAnchor(null);
             final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
@@ -876,6 +912,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
         } catch (Exception e) {
             log.error("Failed to load regions", e);
+            events.add("ERROR loading anchors: " + e);
         }
     }
 
@@ -943,6 +980,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
         } catch (Exception e) {
             log.error("Failed to load region profiles", e);
+            events.add("ERROR loading layout profiles: " + e);
         }
     }
 
@@ -1097,6 +1135,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         log.debug("Switched layout profile {} -> {} (seeded={})", fromKey, key, seeded);
+        events.add("Layout profile " + fromKey + " -> " + key + (seeded ? " (new, copied from previous)" : "")
+                + ", canvas " + dim(currentDim));
         saveRegions();
         // Profile swaps are rare and important — persist immediately rather than waiting
         // for the debounced flush.
@@ -1210,6 +1250,9 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (elapsedMs >= 5) {
                 log.debug("Slow anchor tick: {} ms (regions={}, tracked={}, assignments={})",
                         elapsedMs, anchorRegions.size(), trackedOverlays.size(), overlayAssignments.size());
+                if (elapsedMs >= 20) {
+                    events.add("slow", "Slow tick: " + elapsedMs + " ms");
+                }
             }
         }
     }
@@ -1244,6 +1287,10 @@ public class AnchorCustomizerPlugin extends Plugin {
 
                 if (lastViewport == null) {
                     lastViewport = currentDim;
+                } else if (!lastViewport.equals(currentDim)) {
+                    events.add("canvas", "Canvas resized to " + dim(currentDim)
+                            + (inStartupGrace ? " (ignored: starting up)"
+                            : !loggedIn ? " (ignored: not logged in)" : ""));
                 }
 
                 if (!inStartupGrace && loggedIn) {
@@ -1829,6 +1876,8 @@ public class AnchorCustomizerPlugin extends Plugin {
                     if (assignedRegionId == null || !assignedRegionId.equals(region.getId())) {
                         overlayAssignments.put(overlayId, region.getId());
                         markAssignmentsDirty();
+                        events.add("Captured " + overlayId + " into anchor " + region.getId()
+                                + (assignedRegionId == null ? "" : " (was anchor " + assignedRegionId + ")"));
                     }
                     if (!trackedOverlays.containsKey(overlayId)) {
                         trackedOverlays.put(overlayId, overlay);
@@ -1862,6 +1911,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                         originNormalized.remove(overlayId);
                         markAssignmentsDirty();
                         log.debug("Released overlay {} from all regions (dropped in empty space)", overlayId);
+                        events.add("Released " + overlayId + " from anchor " + assignedRegionId + " (dropped outside)");
                     }
                 }
             }
@@ -2432,6 +2482,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
         } catch (Exception e) {
             log.error("Failed to load overlay order", e);
+            events.add("ERROR loading overlay order: " + e);
         }
     }
 
@@ -2449,6 +2500,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             }
         } catch (Exception e) {
             log.warn("Failed to load overlay assignments", e);
+            events.add("ERROR loading overlay assignments: " + e);
         }
     }
 
@@ -2611,6 +2663,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             if (assignedRegionId != null && !trackedOverlays.containsKey(overlayId)) {
                 trackedOverlays.put(overlayId, overlay);
                 log.debug("Re-acquired overlay {} for region {}", overlayId, assignedRegionId);
+                events.add("Found " + overlayId + " for anchor " + assignedRegionId);
 
                 // Fix L1: seed preferredLocation if missing or out-of-region
                 AnchorRegion region = regionsById.get(assignedRegionId);
@@ -2701,6 +2754,7 @@ public class AnchorCustomizerPlugin extends Plugin {
                     it.remove();
                     originNormalized.remove(entry.getKey());
                     log.debug("Removed stale overlay reference: {}", entry.getKey());
+                    events.add("Lost " + entry.getKey() + " (its plugin removed the overlay)");
                 }
             }
         }
@@ -2841,6 +2895,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         loadOverlayOrder();
         scanAndReacquireOverlays();
         requestSnap();
+        events.add("Imported a layout: " + anchorRegions.size() + " anchors, " + overlayAssignments.size()
+                + " assigned overlays");
 
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
         SwingUtilities.invokeLater(() -> {
@@ -2853,6 +2909,296 @@ public class AnchorCustomizerPlugin extends Plugin {
     private String childJsonString(JsonObject root, String key, String fallback) {
         JsonElement el = root.get(key);
         return el == null || el.isJsonNull() ? fallback : gson.toJson(el);
+    }
+
+    // ---- Diagnostics: "Copy diagnostics" / "Report issue on GitHub" -------------------
+    //
+    // One report with what past GitHub issues kept asking for: versions, monitors and
+    // scaling, the layout profile, settings, other plugins, every anchor, every anchored
+    // overlay (live state and what RuneLite saved for it), the saved layout, and the
+    // recent events. Read-only; nothing leaves the machine unless the user pastes it.
+
+    private static final Set<String> INTERNAL_CONFIG_KEYS = new HashSet<>(java.util.Arrays.asList(
+            "regionJson", "regionProfiles", "overlayAssignments", "overlayOrder", "selectedRegionId"));
+
+    // Enabled plugins whose names match these have interfered with anchors in past issues
+    // (renderers, cursor plugins, chat and infobox plugins, stretched mode).
+    private static final String[] NOTABLE_PLUGIN_HINTS = {
+            "117", "gpu", "cursor", "chat widget", "resizable chat", "stretched", "interface style", "infobox",
+            "vital", "time tracking reminder"};
+
+    // RuneLite's per-overlay keys in the "runelite" config group (OverlayManager).
+    private static final String[] OVERLAY_CONFIG_SUFFIXES = {
+            "_preferredLocation", "_preferredSize", "_preferredPosition", "_origin", "_originX", "_originY"};
+
+    /**
+     * Build the diagnostics report on the client thread (where the anchor and overlay
+     * state lives) and wait briefly for it. Returns null on failure.
+     */
+    public String buildDiagnosticsReport() {
+        final CompletableFuture<String> result = new CompletableFuture<>();
+        clientThread.invoke(() -> {
+            try {
+                flushPendingSaves(true);
+                result.complete(collectDiagnostics());
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        });
+        try {
+            return result.get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("Building diagnostics failed", e);
+            return null;
+        }
+    }
+
+    public void openIssueForm(String report) {
+        LinkBrowser.browse(DiagnosticsReport.issueUrl(report));
+    }
+
+    public void openLogsFolder() {
+        LinkBrowser.open(RuneLite.LOGS_DIR.getAbsolutePath());
+    }
+
+    private String collectDiagnostics() {
+        java.awt.Canvas canvas = client.getCanvas();
+        GraphicsDevice windowDevice = canvas != null && canvas.getGraphicsConfiguration() != null
+                ? canvas.getGraphicsConfiguration().getDevice() : null;
+        Dimension real = client.getRealDimensions();
+
+        List<String> enabledPlugins = new ArrayList<>(new TreeSet<>(enabledPluginNames()));
+        List<String> notable = new ArrayList<>();
+        for (String name : enabledPlugins) {
+            String lower = name.toLowerCase();
+            for (String hint : NOTABLE_PLUGIN_HINTS) {
+                if (lower.contains(hint)) {
+                    notable.add(name);
+                    break;
+                }
+            }
+        }
+
+        int missing = 0;
+        for (String key : overlayAssignments.keySet()) {
+            if (!trackedOverlays.containsKey(key) && !movableOverlayByKey.containsKey(key)) {
+                missing++;
+            }
+        }
+        int disabledAnchors = 0;
+        for (AnchorRegion r : anchorRegions) {
+            if (r.isDisabled()) disabledAnchors++;
+        }
+
+        Map<String, String> summary = new LinkedHashMap<>();
+        summary.put("Plugin version", pluginVersion());
+        String launcher = RuneLiteProperties.getLauncherVersion();
+        summary.put("RuneLite", RuneLiteProperties.getVersion() + " (" + shortCommit(RuneLiteProperties.getCommit()) + ")"
+                + (launcher != null ? ", launcher " + launcher : ""));
+        summary.put("Java", System.getProperty("java.version") + " " + System.getProperty("java.vendor"));
+        summary.put("OS", System.getProperty("os.name") + " " + System.getProperty("os.version")
+                + " " + System.getProperty("os.arch"));
+        summary.put("Client", (client.isResized() ? "Resizable" : "Fixed") + ", canvas " + dim(real)
+                + (client.isStretchedEnabled() ? ", stretched to " + dim(client.getStretchedDimensions()) : "")
+                + ", " + client.getGameState());
+        summary.put("Window", windowDescription(canvas, windowDevice));
+        summary.put("Layout profile", (activeProfileKey != null ? activeProfileKey : "not chosen yet (chosen after login)")
+                + ", stored: " + profileSummary());
+        summary.put("Drag hotkey", runeLiteConfig != null ? String.valueOf(runeLiteConfig.dragHotkey()) : "?");
+        summary.put("Settings", "Show anchors " + config.anchorVisibility()
+                + ", render over interfaces " + config.drawAboveInterfaces()
+                + ", stack spacing " + config.stackSpacing()
+                + ", sidebar button " + config.showSidebarButton()
+                + ", debug logging " + config.debugLogging()
+                + ", side panel open " + (panel != null && panel.isShowing()));
+        summary.put("Anchors", anchorRegions.size() + (disabledAnchors > 0 ? " (" + disabledAnchors + " disabled)" : ""));
+        summary.put("Anchored overlays", overlayAssignments.size() + " assigned, " + trackedOverlays.size()
+                + " tracked, " + missing + " not found");
+        summary.put("Plugins to note", notable.isEmpty() ? "none" : String.join(", ", notable));
+
+        // No HTML escaping, so overlay names like "a=b" stay readable.
+        Gson g = gson.newBuilder().disableHtmlEscaping().create();
+        Map<String, String> sections = new LinkedHashMap<>();
+        sections.put("Displays", jsonLines(g, displaysJson(windowDevice)));
+        sections.put("Anchors", jsonLines(g, anchorsJson(real)));
+        sections.put("Anchored overlays", jsonLines(g, overlaysJson()));
+        JsonArray plugins = new JsonArray();
+        enabledPlugins.forEach(plugins::add);
+        sections.put("Enabled plugins (" + enabledPlugins.size() + ")", g.toJson(plugins));
+        sections.put("Saved layout (importable with Import layout)", buildExportJson(g, config));
+
+        Map<String, String> redactions = new LinkedHashMap<>();
+        String home = System.getProperty("user.home");
+        if (home != null) {
+            redactions.put(home, "~");
+            redactions.put(home.replace('\\', '/'), "~");
+            redactions.put(home.replace("\\", "\\\\"), "~");
+        }
+        Player local = client.getLocalPlayer();
+        if (local != null && local.getName() != null) {
+            redactions.put(local.getName(), "<player>");
+        }
+
+        return DiagnosticsReport.render(summary, sections, events.snapshot(), redactions);
+    }
+
+    private List<String> enabledPluginNames() {
+        List<String> names = new ArrayList<>();
+        if (pluginManager == null) {
+            return names;
+        }
+        for (Plugin p : pluginManager.getPlugins()) {
+            if (pluginManager.isPluginEnabled(p)) {
+                names.add(p.getName());
+            }
+        }
+        return names;
+    }
+
+    /** The Plugin Hub version (the pinned commit), or a note when running a local build. */
+    private static String pluginVersion() {
+        try {
+            PluginHubManifest.DisplayData data = ExternalPluginManager.getDisplayData(AnchorCustomizerPlugin.class);
+            if (data == null) {
+                return "local build (not from the Plugin Hub)";
+            }
+            return shortCommit(data.getVersion()) + (data.getLastUpdatedAt() > 0
+                    ? ", updated " + java.time.Instant.ofEpochMilli(data.getLastUpdatedAt()).toString().substring(0, 10)
+                    : "");
+        } catch (Throwable t) {
+            return "unknown";
+        }
+    }
+
+    private static String shortCommit(String commit) {
+        return commit != null && commit.length() > 10 && commit.matches("[0-9a-f]+") ? commit.substring(0, 10) : commit;
+    }
+
+    private static String windowDescription(java.awt.Canvas canvas, GraphicsDevice device) {
+        Window window = canvas != null ? SwingUtilities.getWindowAncestor(canvas) : null;
+        if (window == null) {
+            return "?";
+        }
+        Rectangle b = window.getBounds();
+        boolean maximized = window instanceof Frame
+                && (((Frame) window).getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
+        return rect(b) + (maximized ? ", maximized" : "") + (device != null ? ", on " + device.getIDstring() : "");
+    }
+
+    private String profileSummary() {
+        if (profileLayouts.isEmpty()) {
+            return "none";
+        }
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, List<AnchorRegion>> e : new java.util.TreeMap<>(profileLayouts).entrySet()) {
+            parts.add(e.getKey() + "=" + e.getValue().size());
+        }
+        return String.join(", ", parts);
+    }
+
+    private static JsonArray displaysJson(GraphicsDevice windowDevice) {
+        JsonArray out = new JsonArray();
+        if (GraphicsEnvironment.isHeadless()) {
+            return out;
+        }
+        for (GraphicsDevice d : GraphicsEnvironment.getLocalGraphicsEnvironment().getScreenDevices()) {
+            JsonObject o = new JsonObject();
+            o.addProperty("id", d.getIDstring());
+            java.awt.DisplayMode mode = d.getDisplayMode();
+            o.addProperty("mode", mode.getWidth() + "x" + mode.getHeight() + "@" + mode.getRefreshRate() + "Hz");
+            Rectangle b = d.getDefaultConfiguration().getBounds();
+            o.addProperty("bounds", rect(b));
+            AffineTransform t = d.getDefaultConfiguration().getDefaultTransform();
+            o.addProperty("scale", t.getScaleX() + "x" + t.getScaleY());
+            o.addProperty("portrait", b.height > b.width);
+            o.addProperty("hasWindow", d == windowDevice);
+            out.add(o);
+        }
+        return out;
+    }
+
+    private JsonArray anchorsJson(Dimension canvas) {
+        JsonArray out = new JsonArray();
+        Rectangle canvasRect = canvas == null ? null : new Rectangle(0, 0, canvas.width, canvas.height);
+        for (AnchorRegion r : anchorRegions) {
+            JsonObject o = gson.toJsonTree(r).getAsJsonObject();
+            if (canvasRect != null) {
+                Rectangle b = r.getBounds();
+                o.addProperty("onCanvas", canvasRect.contains(b) ? "fully" : canvasRect.intersects(b) ? "partly" : "off");
+            }
+            out.add(o);
+        }
+        return out;
+    }
+
+    private JsonArray overlaysJson() {
+        List<Map.Entry<String, Integer>> entries = new ArrayList<>(overlayAssignments.entrySet());
+        entries.sort((a, b) -> {
+            int c = Integer.compare(a.getValue(), b.getValue());
+            return c != 0 ? c : Integer.compare(overlayOrder.getOrDefault(a.getKey(), Integer.MAX_VALUE),
+                    overlayOrder.getOrDefault(b.getKey(), Integer.MAX_VALUE));
+        });
+        JsonArray out = new JsonArray();
+        for (Map.Entry<String, Integer> a : entries) {
+            String key = a.getKey();
+            Overlay ov = trackedOverlays.get(key);
+            if (ov == null) ov = movableOverlayByKey.get(key);
+            JsonObject o = new JsonObject();
+            o.addProperty("key", key);
+            o.addProperty("anchor", a.getValue());
+            o.addProperty("order", overlayOrder.get(key));
+            o.addProperty("found", ov != null);
+            o.addProperty("tracked", trackedOverlays.containsKey(key));
+            if (ov != null) {
+                Plugin owner = ov.getPlugin();
+                o.addProperty("plugin", owner != null ? owner.getName() : null);
+                o.addProperty("class", ov.getClass().getName());
+                o.addProperty("movable", ov.isMovable());
+                o.addProperty("layer", String.valueOf(ov.getLayer()));
+                o.addProperty("position", String.valueOf(ov.getPosition()));
+                o.addProperty("preferredPosition", String.valueOf(ov.getPreferredPosition()));
+                o.addProperty("preferredLocation", point(ov.getPreferredLocation()));
+                o.addProperty("preferredSize", ov.getPreferredSize() == null ? null : dim(ov.getPreferredSize()));
+                o.addProperty("bounds", rect(ov.getBounds()));
+            }
+            o.addProperty("target", point(overlayTargets.get(key)));
+            if (configManager != null) {
+                JsonObject saved = new JsonObject();
+                for (String suffix : OVERLAY_CONFIG_SUFFIXES) {
+                    String v = configManager.getConfiguration("runelite", key + suffix);
+                    if (v != null) {
+                        saved.addProperty(suffix.substring(1), v);
+                    }
+                }
+                o.add("savedByRuneLite", saved);
+            }
+            out.add(o);
+        }
+        return out;
+    }
+
+    /** One compact JSON object per line: readable in an issue, still valid JSON. */
+    static String jsonLines(Gson g, JsonArray array) {
+        if (array.size() == 0) {
+            return "[]";
+        }
+        StringBuilder b = new StringBuilder("[\n");
+        for (int i = 0; i < array.size(); i++) {
+            b.append("  ").append(g.toJson(array.get(i))).append(i < array.size() - 1 ? ",\n" : "\n");
+        }
+        return b.append(']').toString();
+    }
+
+    private static String dim(Dimension d) {
+        return d == null ? null : d.width + "x" + d.height;
+    }
+
+    private static String point(Point p) {
+        return p == null ? null : p.x + "," + p.y;
+    }
+
+    private static String rect(Rectangle r) {
+        return r == null ? null : r.x + "," + r.y + " " + r.width + "x" + r.height;
     }
 
     @Provides

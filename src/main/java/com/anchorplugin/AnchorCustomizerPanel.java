@@ -10,6 +10,7 @@ import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
+import java.awt.GridLayout;
 import java.awt.Insets;
 import java.awt.Toolkit;
 import java.util.List;
@@ -405,6 +406,64 @@ public class AnchorCustomizerPanel extends PluginPanel {
         propertiesPanel.add(deleteButton, c);
 
         add(propertiesPanel, BorderLayout.CENTER);
+        add(buildSupportPanel(), BorderLayout.SOUTH);
+    }
+
+    /** "Having a problem?" section: copy diagnostics, report on GitHub, open the logs folder. */
+    private JPanel buildSupportPanel() {
+        JPanel support = new JPanel(new GridLayout(0, 1, 0, 4));
+        support.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        support.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder("Having a problem?"), new EmptyBorder(2, 4, 4, 4)));
+
+        JButton copyButton = new JButton("Copy diagnostics");
+        copyButton.setToolTipText("<html>Shows a report of your setup to copy into a GitHub issue: versions, monitors,<br>"
+                + "settings, enabled plugins, your anchors and anchored UI, and recent events.<br>"
+                + "Your account name and folders are left out. Nothing is sent anywhere.</html>");
+        copyButton.addActionListener(e -> showDiagnostics());
+
+        JButton reportButton = new JButton("Report issue on GitHub");
+        reportButton.setToolTipText("<html>Copies the diagnostics and opens the GitHub bug form in your browser.<br>"
+                + "Nothing is posted until you submit the form.</html>");
+        reportButton.addActionListener(e -> reportIssue());
+
+        JButton logsButton = new JButton("Open logs folder");
+        logsButton.setToolTipText("Opens RuneLite's logs folder. Attach client.log to your issue if asked.");
+        logsButton.addActionListener(e -> plugin.openLogsFolder());
+
+        support.add(copyButton);
+        support.add(reportButton);
+        support.add(logsButton);
+        return support;
+    }
+
+    private String buildReportOrWarn() {
+        String report = plugin.buildDiagnosticsReport();
+        if (report == null) {
+            JOptionPane.showMessageDialog(this, "Couldn't build the diagnostics. Please attach client.log instead.",
+                    "Custom UI Anchors", JOptionPane.ERROR_MESSAGE);
+        }
+        return report;
+    }
+
+    private void showDiagnostics() {
+        String report = buildReportOrWarn();
+        if (report != null) {
+            DiagnosticsDialog.show(this, report, plugin::openIssueForm);
+        }
+    }
+
+    private void reportIssue() {
+        String report = buildReportOrWarn();
+        if (report == null) {
+            return;
+        }
+        DiagnosticsDialog.copy(report);
+        plugin.openIssueForm(report);
+        JOptionPane.showMessageDialog(this,
+                "The diagnostics are on your clipboard. If the Diagnostics box on GitHub is empty, paste them there.\n"
+                        + "Videos and screenshots help a lot.",
+                "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
     }
 
     private JSpinner createSpinner(String title) {

@@ -1,0 +1,20 @@
+name: Bug report
+description: Something isn't working right
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Videos and screenshots help a lot, so drag them in here.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: In the Custom UI Anchors side panel, click **Copy diagnostics** under "Having a problem?" and paste it here.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Click **Open logs folder** in the same section, then drag `client.log` in here.
