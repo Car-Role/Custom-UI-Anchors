@@ -27,6 +27,8 @@ import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JList;
+import javax.swing.JMenuItem;
+import javax.swing.JPopupMenu;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
@@ -36,6 +38,7 @@ import javax.swing.ListSelectionModel;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.TransferHandler;
 import javax.swing.border.EmptyBorder;
+import net.runelite.client.RuneLite;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 
@@ -85,17 +88,23 @@ public class AnchorCustomizerPanel extends PluginPanel {
         // topControlPanel.setBorder(new EmptyBorder(0, 0, 10, 0));
 
         // Clipboard export/import of the whole layout (GitHub issue #23); all logic
-        // lives in the plugin, these buttons are just the UI entry points.
+        // lives in the plugin, these are just the UI entry points. One button with a
+        // menu: two side-by-side buttons didn't fit the sidebar width, which hid Import.
         JPanel ioPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
         ioPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        JButton exportButton = new JButton("Export layout");
-        exportButton.setToolTipText("Copy all anchors, profiles and overlay assignments to the clipboard as JSON.");
-        exportButton.addActionListener(e -> exportLayout());
-        JButton importButton = new JButton("Import layout");
-        importButton.setToolTipText("Replace all anchors, profiles and overlay assignments with a layout JSON on the clipboard.");
-        importButton.addActionListener(e -> importLayout());
-        ioPanel.add(exportButton);
-        ioPanel.add(importButton);
+        JPopupMenu ioMenu = new JPopupMenu();
+        JMenuItem exportItem = new JMenuItem("Export layout");
+        exportItem.setToolTipText("Copy all anchors, profiles and overlay assignments to the clipboard as JSON.");
+        exportItem.addActionListener(e -> exportLayout());
+        JMenuItem importItem = new JMenuItem("Import layout");
+        importItem.setToolTipText("Replace all anchors, profiles and overlay assignments with a layout JSON on the clipboard.");
+        importItem.addActionListener(e -> importLayout());
+        ioMenu.add(exportItem);
+        ioMenu.add(importItem);
+        JButton ioButton = new JButton("Export / Import");
+        ioButton.setToolTipText("Copy your layout to the clipboard, or load one from it.");
+        ioButton.addActionListener(e -> ioMenu.show(ioButton, 0, ioButton.getHeight()));
+        ioPanel.add(ioButton);
         topControlPanel.add(ioPanel, BorderLayout.CENTER);
 
         listContainer.add(topControlPanel, BorderLayout.NORTH);
@@ -427,14 +436,31 @@ public class AnchorCustomizerPanel extends PluginPanel {
                 + "Nothing is posted until you submit the form.</html>");
         reportButton.addActionListener(e -> reportIssue());
 
-        JButton logsButton = new JButton("Open logs folder");
-        logsButton.setToolTipText("Opens RuneLite's logs folder. Attach client.log to your issue if asked.");
-        logsButton.addActionListener(e -> plugin.openLogsFolder());
+        JButton logsButton = new JButton("Copy logs folder path");
+        logsButton.setToolTipText("Copies where RuneLite keeps client.log, so you can open it and attach the file to your issue.");
+        logsButton.addActionListener(e -> copyLogsFolderPath());
 
         support.add(copyButton);
         support.add(reportButton);
         support.add(logsButton);
         return support;
+    }
+
+    /**
+     * Plugin Hub plugins may not open folders (process execution isn't allowed), so
+     * copy the path and tell the user where to paste it.
+     */
+    private void copyLogsFolderPath() {
+        String path = RuneLite.LOGS_DIR.getAbsolutePath();
+        DiagnosticsDialog.copy(path);
+        String os = System.getProperty("os.name", "").toLowerCase();
+        String howTo = os.contains("win") ? "Press Win+R, paste it and press Enter."
+                : os.contains("mac") ? "In Finder press Cmd+Shift+G, paste it and press Enter."
+                : "Paste it into your file manager's location bar.";
+        JOptionPane.showMessageDialog(this,
+                "Copied the logs folder path:\n" + path + "\n\n" + howTo
+                        + "\nThen drag client.log into your GitHub issue.",
+                "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
     }
 
     private String buildReportOrWarn() {

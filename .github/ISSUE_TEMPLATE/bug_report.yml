@@ -17,4 +17,4 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Click **Open logs folder** in the same section, then drag `client.log` in here.
+      description: Click **Copy logs folder path** in the same section, open that folder, then drag `client.log` in here.

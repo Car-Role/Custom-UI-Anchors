@@ -15,8 +15,8 @@ import net.runelite.client.config.Units;
 public interface AnchorCustomizerConfig extends Config {
 
     // RuneLite's config panel can't host buttons, so this section points to the side panel's
-    // "Having a problem?" buttons (Copy diagnostics / Report issue on GitHub / Open logs folder).
-    @ConfigSection(name = "Report an issue", description = "To report a problem, open the Custom UI Anchors side panel and use the buttons under \"Having a problem?\" at the bottom: Copy diagnostics, Report issue on GitHub, and Open logs folder. If the sidebar button is hidden, turn on Show sidebar button first.", position = 10)
+    // "Having a problem?" buttons (Copy diagnostics / Report issue on GitHub / Copy logs folder path).
+    @ConfigSection(name = "Report an issue", description = "To report a problem, open the Custom UI Anchors side panel and use the buttons under \"Having a problem?\" at the bottom: Copy diagnostics, Report issue on GitHub, and Copy logs folder path. If the sidebar button is hidden, turn on Show sidebar button first.", position = 10)
     String reportSection = "reportSection";
 
     @ConfigItem(keyName = "showSidebarButton", name = "Show sidebar button", description = "Show the Custom UI Anchors button in the RuneLite sidebar. Turn this off to hide it once your anchors are set up. The side panel also has the Copy diagnostics and Report issue buttons for bug reports.", position = 1)
@@ -41,7 +41,7 @@ public interface AnchorCustomizerConfig extends Config {
         return AnchorVisibility.HOTKEY_HELD;
     }
 
-    @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "To report a problem, use Copy diagnostics or Report issue on GitHub in the side panel (under \"Having a problem?\"). Turn this on only if asked: it writes extra details to client.log while you reproduce the problem (open it with Open logs folder in the side panel).", position = 11, section = reportSection)
+    @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "To report a problem, use Copy diagnostics or Report issue on GitHub in the side panel (under \"Having a problem?\"). Turn this on only if asked: it writes extra details to client.log while you reproduce the problem (find it with Copy logs folder path in the side panel).", position = 11, section = reportSection)
     default boolean debugLogging() {
         return false;
     }

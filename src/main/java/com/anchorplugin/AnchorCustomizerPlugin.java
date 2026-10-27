@@ -56,7 +56,6 @@ import net.runelite.api.events.ClientTick;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.Player;
-import net.runelite.client.RuneLite;
 import net.runelite.client.RuneLiteProperties;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -2955,10 +2954,6 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     public void openIssueForm(String report) {
         LinkBrowser.browse(DiagnosticsReport.issueUrl(report));
-    }
-
-    public void openLogsFolder() {
-        LinkBrowser.open(RuneLite.LOGS_DIR.getAbsolutePath());
     }
 
     private String collectDiagnostics() {
