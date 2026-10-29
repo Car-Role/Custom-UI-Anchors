@@ -181,10 +181,12 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     private static final String FIXED_PROFILE_KEY = "fixed";
 
-    // Throttle for the profile re-check in onClientTick (the display-mode query goes
-    // through the AWT toolkit; no need to poll it at tick rate when nothing changed).
-    private long lastProfileCheckTime = 0L;
-    private static final long PROFILE_CHECK_INTERVAL_MS = 1000L;
+    // Set by AWT when the canvas moves to another screen. The profile re-check calls
+    // GraphicsDevice.getDisplayMode(), which on X11 with the NVIDIA driver forces a
+    // full randr re-probe of every output, so it must not run on a timer.
+    private volatile boolean displayChanged = true;
+    private java.awt.Canvas watchedCanvas;
+    private final java.beans.PropertyChangeListener displayChangeListener = e -> displayChanged = true;
 
     // The RuneLite canvas frequently resizes once during the first few hundred ms of
     // plugin life, and again whenever the user transitions between login-screen (fixed
@@ -332,7 +334,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         lastWrittenProfilesJson = null;
         activeProfileKey = null;
         profileLayouts.clear();
-        lastProfileCheckTime = 0L;
+        displayChanged = true;
         lastViewport = null;
         startupTimeMs = System.currentTimeMillis();
         lastResizeTime = 0L;
@@ -484,6 +486,7 @@ public class AnchorCustomizerPlugin extends Plugin {
             clientToolbar.removeNavigation(navButton);
             navButtonAdded = false;
         }
+        unwatchCanvas();
         anchorRegions.clear();
         profileLayouts.clear();
         activeProfileKey = null;
@@ -1059,6 +1062,29 @@ public class AnchorCustomizerPlugin extends Plugin {
         return mw + "x" + mh;
     }
 
+    /**
+     * Keep the screen-change listener attached to the current canvas. The canvas can be
+     * null early in startup or replaced later, so this is re-checked every tick; a newly
+     * watched canvas forces one profile re-check.
+     */
+    private void watchCanvasForDisplayChanges() {
+        java.awt.Canvas canvas = client.getCanvas();
+        if (canvas == watchedCanvas) return;
+        unwatchCanvas();
+        if (canvas != null) {
+            canvas.addPropertyChangeListener("graphicsConfiguration", displayChangeListener);
+        }
+        watchedCanvas = canvas;
+        displayChanged = true;
+    }
+
+    private void unwatchCanvas() {
+        if (watchedCanvas != null) {
+            watchedCanvas.removePropertyChangeListener("graphicsConfiguration", displayChangeListener);
+            watchedCanvas = null;
+        }
+    }
+
     /** Clamp a region fully on-canvas (and shrink it if larger than the canvas). */
     private void clampToCanvas(AnchorRegion r, Dimension dim) {
         if (dim == null || dim.width <= 0 || dim.height <= 0) return;
@@ -1299,16 +1325,15 @@ public class AnchorCustomizerPlugin extends Plugin {
                     // derives, clamps (seed only), rebaselines and persists, so the
                     // rest of this tick can be skipped for this pass.
                     //
-                    // Throttled: the display-mode query touches the AWT toolkit, so only
-                    // re-check when unresolved, when the canvas dim moved (mode toggles
-                    // and cross-DPI monitor drags always change it), or once per
-                    // interval as a safety net (e.g. same-dim monitor swaps).
-                    long now = System.currentTimeMillis();
+                    // Only re-check when unresolved, when the canvas dim moved (mode
+                    // toggles and cross-DPI monitor drags always change it), or when AWT
+                    // reports the canvas moved to another screen (same-dim monitor swaps).
+                    watchCanvasForDisplayChanges();
                     boolean checkProfile = activeProfileKey == null
                             || !lastViewport.equals(currentDim)
-                            || (now - lastProfileCheckTime) >= PROFILE_CHECK_INTERVAL_MS;
+                            || displayChanged;
                     if (checkProfile) {
-                        lastProfileCheckTime = now;
+                        displayChanged = false;
                         String matchKey = computeProfileMatch();
                         if (matchKey != null && !matchKey.equals(activeProfileKey)) {
                             switchProfile(matchKey, currentDim);
