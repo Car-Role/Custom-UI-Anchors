@@ -38,7 +38,6 @@ import javax.swing.ListSelectionModel;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.TransferHandler;
 import javax.swing.border.EmptyBorder;
-import net.runelite.client.RuneLite;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 
@@ -447,14 +446,16 @@ public class AnchorCustomizerPanel extends PluginPanel {
     }
 
     /**
-     * Plugin Hub plugins may not open folders (process execution isn't allowed), so
-     * copy the path and tell the user where to paste it.
+     * Plugin Hub plugins may not open folders (process execution isn't allowed) and
+     * should keep away from file APIs, so copy RuneLite's standard logs location as
+     * plain text and tell the user where to paste it.
      */
     private void copyLogsFolderPath() {
-        String path = RuneLite.LOGS_DIR.getAbsolutePath();
-        DiagnosticsDialog.copy(path);
         String os = System.getProperty("os.name", "").toLowerCase();
-        String howTo = os.contains("win") ? "Press Win+R, paste it and press Enter."
+        boolean windows = os.contains("win");
+        String path = windows ? "%USERPROFILE%\\.runelite\\logs" : "~/.runelite/logs";
+        DiagnosticsDialog.copy(path);
+        String howTo = windows ? "Press Win+R, paste it and press Enter."
                 : os.contains("mac") ? "In Finder press Cmd+Shift+G, paste it and press Enter."
                 : "Paste it into your file manager's location bar.";
         JOptionPane.showMessageDialog(this,

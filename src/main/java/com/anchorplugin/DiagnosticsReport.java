@@ -4,8 +4,7 @@
  */
 package com.anchorplugin;
 
-import java.io.UnsupportedEncodingException;
-import java.net.URLEncoder;
+import com.google.common.net.UrlEscapers;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -107,10 +106,6 @@ final class DiagnosticsReport {
     }
 
     private static String encode(String text) {
-        try {
-            return URLEncoder.encode(text, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            throw new IllegalStateException(e);
-        }
+        return UrlEscapers.urlFormParameterEscaper().escape(text);
     }
 }

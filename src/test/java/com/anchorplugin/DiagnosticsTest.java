@@ -113,6 +113,7 @@ public class DiagnosticsTest {
     public void issueUrlPrefillsOnlyWhenItFits() {
         String small = DiagnosticsReport.issueUrl("### short report");
         assertTrue(small.startsWith(DiagnosticsReport.NEW_ISSUE_URL + "&diagnostics="));
+        assertTrue(small.endsWith("&diagnostics=%23%23%23+short+report"));
         assertTrue(small.length() <= DiagnosticsReport.MAX_URL_CHARS);
 
         String big = DiagnosticsReport.issueUrl(new String(new char[10_000]).replace('\0', 'x'));
