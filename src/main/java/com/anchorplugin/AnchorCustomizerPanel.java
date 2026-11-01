@@ -60,6 +60,11 @@ public class AnchorCustomizerPanel extends PluginPanel {
     private final JComboBox<AnchorFillDirection> fillDirectionComboBox;
     private final JLabel wrapLabel;
     private final JComboBox<AnchorFillDirection> wrapDirectionComboBox;
+    private final JComboBox<Integer> spacingComboBox;
+    // Spacing choices: "Default" (follow the global setting) then 0..MAX_SPACING px,
+    // matching the global Stack spacing range.
+    private static final int DEFAULT_SPACING = -1;
+    private static final int MAX_SPACING = 20;
     private final JCheckBox enabledCheckBox;
     private final JCheckBox pinToChatCheckBox;
 
@@ -334,6 +339,37 @@ public class AnchorCustomizerPanel extends PluginPanel {
         wrapDirectionComboBox.addActionListener(e -> saveChanges());
         propertiesPanel.add(wrapDirectionComboBox, c);
 
+        // Per-anchor spacing (GitHub issue #30): the gap between items stacked in this
+        // box. "Default" follows the global Stack spacing setting.
+        c.gridy++;
+        JLabel spacingLabel = new JLabel("Spacing:");
+        spacingLabel.setToolTipText("Gap between items stacked in this box, in pixels. "
+                + "Default follows the Stack spacing setting in the plugin's configuration; "
+                + "0 packs them flush (e.g. orbs, so clicks can't fall between them).");
+        propertiesPanel.add(spacingLabel, c);
+        c.gridy++;
+        Integer[] spacingChoices = new Integer[MAX_SPACING + 2];
+        spacingChoices[0] = DEFAULT_SPACING;
+        for (int i = 0; i <= MAX_SPACING; i++) {
+            spacingChoices[i + 1] = i;
+        }
+        spacingComboBox = new JComboBox<>(spacingChoices);
+        spacingComboBox.setToolTipText(spacingLabel.getToolTipText());
+        spacingComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public java.awt.Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                int v = value instanceof Integer ? (Integer) value : DEFAULT_SPACING;
+                setText(v == DEFAULT_SPACING
+                        ? "Default (" + plugin.getConfig().stackSpacing() + " px)"
+                        : v + " px");
+                return this;
+            }
+        });
+        spacingComboBox.addActionListener(e -> saveChanges());
+        propertiesPanel.add(spacingComboBox, c);
+
         // Switching stacking mode flips the fill/wrap axis labels and may
         // hide/show the controls entirely; refresh both before saving.
         stackingComboBox.addActionListener(e -> {
@@ -583,6 +619,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
         wrapDirectionComboBox.setSelectedItem(
                 selectedRegion.getWrapDirection() != null ? selectedRegion.getWrapDirection() : AnchorFillDirection.FORWARD);
         updateFillDirectionVisibility();
+        Integer spacing = selectedRegion.getSpacing();
+        spacingComboBox.setSelectedItem(spacing == null ? DEFAULT_SPACING : Math.max(0, Math.min(MAX_SPACING, spacing)));
         enabledCheckBox.setSelected(!selectedRegion.isDisabled());
         pinToChatCheckBox.setSelected(selectedRegion.isPinToChat());
         isUpdating = false;
@@ -631,6 +669,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
         final AnchorFillDirection newWrapDirection = pickedWrap != null ? pickedWrap : AnchorFillDirection.FORWARD;
         final boolean newEnabled = enabledCheckBox.isSelected();
         final boolean newPinToChat = pinToChatCheckBox.isSelected();
+        Integer pickedSpacing = (Integer) spacingComboBox.getSelectedItem();
+        final Integer newSpacing = pickedSpacing == null || pickedSpacing == DEFAULT_SPACING ? null : pickedSpacing;
 
         plugin.updateRegion(selectedRegion, r -> {
             r.setName(newName);
@@ -645,6 +685,7 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setWrapDirection(newWrapDirection);
             r.setDisabled(!newEnabled);
             r.setPinToChat(newPinToChat);
+            r.setSpacing(newSpacing);
         });
         regionList.repaint(); // Repaint list for name changes
     }

@@ -26,7 +26,7 @@ public interface AnchorCustomizerConfig extends Config {
 
     @Range(min = 0, max = 20)
     @Units(Units.PIXELS)
-    @ConfigItem(keyName = "stackSpacing", name = "Stack spacing", description = "Gap inserted between multiple overlays stacked inside the same anchor region. Set to 0 to pack them flush together.", position = 3)
+    @ConfigItem(keyName = "stackSpacing", name = "Stack spacing", description = "Gap inserted between multiple overlays stacked inside the same anchor region. Set to 0 to pack them flush together. Each anchor can override this with its Spacing setting in the side panel.", position = 3)
     default int stackSpacing() {
         return 2;
     }

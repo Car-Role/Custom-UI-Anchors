@@ -644,7 +644,8 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorFillDirection.FORWARD,
                 AnchorFillDirection.FORWARD,
                 false,
-                0);
+                0,
+                null);
         rebaselineOrigin(region);
 
         anchorRegions.add(region);
@@ -891,6 +892,12 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         region.setY(region.getOriginY() + yShift);
+    }
+
+    /** Gap between items stacked in this box: its own spacing (GitHub issue #30), else the global Stack spacing. */
+    int spacingFor(AnchorRegion region) {
+        Integer own = region.getSpacing();
+        return own != null ? Math.max(0, own) : config.stackSpacing();
     }
 
     /** Vertical shift for a chat-pinned region: how far the chatbox top has moved since the origin snapshot. */
@@ -1437,17 +1444,17 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
         Rectangle h = new Rectangle(mouse.x - off.x, mouse.y - off.y, hb.width, hb.height);
         Point hc = new Point((int) h.getCenterX(), (int) h.getCenterY());
-        boolean overAnchor = false;
+        AnchorRegion overAnchor = null;
         for (AnchorRegion r : anchorRegions) {
             if (!r.isDisabled() && r.getBounds().contains(hc)) {
-                overAnchor = true;
+                overAnchor = r;
                 break;
             }
         }
-        if (!overAnchor) {
+        if (overAnchor == null) {
             return;
         }
-        final int gap = Math.max(1, config.stackSpacing());
+        final int gap = Math.max(1, spacingFor(overAnchor));
         for (Map.Entry<String, Point> entry : overlayTargets.entrySet()) {
             Overlay n = trackedOverlays.get(entry.getKey());
             if (n == null || n == held || !n.isDragTargetable() || n.getClass() != held.getClass()
@@ -1750,10 +1757,6 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (anchorRegions.isEmpty())
             return;
 
-        // Inter-overlay gap when stacking multiple overlays in one region. User-configurable
-        // (default 2px, the long-standing hardcoded value); set to 0 to pack overlays flush.
-        final int PADDING = config.stackSpacing();
-
         // Snapshot regions once per call (defensive against EDT/panel edits)
         final List<AnchorRegion> regionsSnapshot = new ArrayList<>(anchorRegions);
 
@@ -1987,6 +1990,10 @@ public class AnchorCustomizerPlugin extends Plugin {
             AnchorStacking stacking = region.getStacking();
             if (stacking == null)
                 stacking = AnchorStacking.VERTICAL;
+
+            // Inter-overlay gap: the box's own spacing, else the global Stack spacing
+            // (default 2px); 0 packs overlays flush.
+            final int PADDING = spacingFor(region);
 
             // Establish item order (GitHub issue #5). While the user is actively arranging
             // overlays here, order follows their live positions and is persisted; otherwise

@@ -183,12 +183,38 @@ public class AnchorFeaturesTest {
         // REVERSE round-trips through serialization.
         AnchorRegion r = new AnchorRegion(2, "Box 2", 0, 0, 100, 100,
                 AnchorConstraint.TOP_LEFT, AnchorAlignment.CENTER, AnchorStacking.FILL_VERTICAL,
-                false, 0, 0, 765, 503, false, AnchorFillDirection.REVERSE, AnchorFillDirection.REVERSE, false, 0);
+                false, 0, 0, 765, 503, false, AnchorFillDirection.REVERSE, AnchorFillDirection.REVERSE, false, 0, null);
         java.util.List<AnchorRegion> back = gson.fromJson(
                 gson.toJson(java.util.Collections.singletonList(r)), t);
         assertEquals(AnchorFillDirection.REVERSE, back.get(0).getFillDirection());
         assertEquals(AnchorFillDirection.REVERSE, back.get(0).getWrapDirection());
     }
+
+    @Test
+    public void perAnchorSpacingOverridesGlobalAndDefaultsToIt() {
+        Gson gson = new Gson();
+        java.lang.reflect.Type t = new com.google.gson.reflect.TypeToken<java.util.List<AnchorRegion>>() {
+        }.getType();
+        AnchorCustomizerPlugin p = new AnchorCustomizerPlugin();
+        p.config = new MemConfig(); // global Stack spacing: default 2
+
+        // Legacy anchors have no spacing: they follow the global setting, and stay that way when saved.
+        AnchorRegion legacy = gson.<java.util.List<AnchorRegion>>fromJson(
+                "[{\"id\":1,\"name\":\"Box 1\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]", t).get(0);
+        assertNull(legacy.getSpacing());
+        assertEquals(2, p.spacingFor(legacy));
+        assertTrue(!gson.toJson(legacy).contains("spacing"));
+
+        // An anchor's own spacing wins, including 0 (flush), and survives save and profile copies.
+        legacy.setSpacing(0);
+        assertEquals(0, p.spacingFor(legacy));
+        AnchorRegion back = gson.<java.util.List<AnchorRegion>>fromJson(
+                gson.toJson(java.util.Collections.singletonList(legacy)), t).get(0);
+        assertEquals(Integer.valueOf(0), back.getSpacing());
+        back.setSpacing(7);
+        assertEquals(Integer.valueOf(7), back.scaledCopy(2.0).getSpacing());
+    }
+
 
     @Test
     public void mirrorPlacesRowsFlushWithFarEdge() {
@@ -234,7 +260,7 @@ public class AnchorFeaturesTest {
                 new AnchorRegion(1, "Box 1", 10, 20, 100, 100,
                         AnchorConstraint.TOP_LEFT, AnchorAlignment.CENTER,
                         AnchorStacking.VERTICAL, false, 10, 20, 765, 503,
-                        false, AnchorFillDirection.FORWARD, AnchorFillDirection.FORWARD, false, 0)));
+                        false, AnchorFillDirection.FORWARD, AnchorFillDirection.FORWARD, false, 0, null)));
         cfg.profiles = "{\"fixed\":[]}";
         cfg.assignments = "{\"someOverlay\":1}";
         cfg.order = "{\"someOverlay\":0}";

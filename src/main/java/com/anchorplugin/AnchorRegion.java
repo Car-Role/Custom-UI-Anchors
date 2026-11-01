@@ -82,6 +82,11 @@ public class AnchorRegion {
     // widget is available, like the legacy origin fields.
     private volatile int originChatTop = 0;
 
+    // Gap between items stacked in this box, in pixels (GitHub issue #30). Null = use the
+    // global "Stack spacing" setting; Gson leaves it null for legacy data and omits it
+    // when writing, so existing layouts are unchanged.
+    private Integer spacing = null;
+
     // Helper to get bounds as AWT Rectangle. Snapshots the four volatile fields in a
     // single call so callers get a self-consistent rectangle (still possible for x/y
     // vs width/height to be read across a drag update, but the worst case is a
@@ -122,6 +127,7 @@ public class AnchorRegion {
                 fillDirection,
                 wrapDirection,
                 pinToChat,
-                (int) Math.round(originChatTop * fy));
+                (int) Math.round(originChatTop * fy),
+                spacing);
     }
 }
