@@ -14,6 +14,7 @@ import java.awt.GridLayout;
 import java.awt.Insets;
 import java.awt.Toolkit;
 import java.util.List;
+import java.util.function.Consumer;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
 import java.awt.datatransfer.Transferable;
@@ -500,33 +501,31 @@ public class AnchorCustomizerPanel extends PluginPanel {
                 "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
     }
 
-    private String buildReportOrWarn() {
-        String report = plugin.buildDiagnosticsReport();
-        if (report == null) {
-            JOptionPane.showMessageDialog(this, "Couldn't build the diagnostics. Please attach client.log instead.",
-                    "Custom UI Anchors", JOptionPane.ERROR_MESSAGE);
-        }
-        return report;
+    /** Build the report in the background, then run {@code action} with it on the EDT (or warn on failure). */
+    private void withReport(Consumer<String> action) {
+        plugin.buildDiagnosticsReport(report -> {
+            if (report == null) {
+                JOptionPane.showMessageDialog(this, "Couldn't build the diagnostics. Please attach client.log instead.",
+                        "Custom UI Anchors", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            action.accept(report);
+        });
     }
 
     private void showDiagnostics() {
-        String report = buildReportOrWarn();
-        if (report != null) {
-            DiagnosticsDialog.show(this, report, plugin::openIssueForm);
-        }
+        withReport(report -> DiagnosticsDialog.show(this, report, plugin::openIssueForm));
     }
 
     private void reportIssue() {
-        String report = buildReportOrWarn();
-        if (report == null) {
-            return;
-        }
-        DiagnosticsDialog.copy(report);
-        plugin.openIssueForm(report);
-        JOptionPane.showMessageDialog(this,
-                "The diagnostics are on your clipboard. If the Diagnostics box on GitHub is empty, paste them there.\n"
-                        + "Videos and screenshots help a lot.",
-                "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
+        withReport(report -> {
+            DiagnosticsDialog.copy(report);
+            plugin.openIssueForm(report);
+            JOptionPane.showMessageDialog(this,
+                    "The diagnostics are on your clipboard. If the Diagnostics box on GitHub is empty, paste them there.\n"
+                            + "Videos and screenshots help a lot.",
+                    "Custom UI Anchors", JOptionPane.INFORMATION_MESSAGE);
+        });
     }
 
     private JSpinner createSpinner(String title) {

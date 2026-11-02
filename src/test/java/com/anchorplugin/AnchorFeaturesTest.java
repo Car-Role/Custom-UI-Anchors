@@ -166,41 +166,37 @@ public class AnchorFeaturesTest {
     @Test
     public void regionJsonLegacyAndReverseRoundTrip() {
         Gson gson = new Gson();
-        java.lang.reflect.Type t = new com.google.gson.reflect.TypeToken<java.util.List<AnchorRegion>>() {
-        }.getType();
 
         // Legacy data: no fillDirection, plus a stale "fillOrigin" key from the
         // abandoned corner-based design — must deserialize cleanly; the field
         // initializer (and normalizeRegions' null-check) leaves it FORWARD.
-        java.util.List<AnchorRegion> legacy = gson.fromJson(
+        AnchorRegion[] legacy = gson.fromJson(
                 "[{\"id\":1,\"name\":\"Box 1\",\"x\":10,\"y\":20,\"width\":100,\"height\":100,"
                         + "\"constraint\":\"TOP_LEFT\",\"alignment\":\"CENTER\",\"stacking\":\"FILL_HORIZONTAL\","
-                        + "\"locked\":false,\"fillOrigin\":\"TOP_RIGHT\"}]", t);
-        assertEquals(1, legacy.size());
-        assertEquals(AnchorFillDirection.FORWARD, legacy.get(0).getFillDirection());
-        assertEquals(AnchorFillDirection.FORWARD, legacy.get(0).getWrapDirection());
+                        + "\"locked\":false,\"fillOrigin\":\"TOP_RIGHT\"}]", AnchorRegion[].class);
+        assertEquals(1, legacy.length);
+        assertEquals(AnchorFillDirection.FORWARD, legacy[0].getFillDirection());
+        assertEquals(AnchorFillDirection.FORWARD, legacy[0].getWrapDirection());
 
         // REVERSE round-trips through serialization.
         AnchorRegion r = new AnchorRegion(2, "Box 2", 0, 0, 100, 100,
                 AnchorConstraint.TOP_LEFT, AnchorAlignment.CENTER, AnchorStacking.FILL_VERTICAL,
                 false, 0, 0, 765, 503, false, AnchorFillDirection.REVERSE, AnchorFillDirection.REVERSE, false, 0, null);
-        java.util.List<AnchorRegion> back = gson.fromJson(
-                gson.toJson(java.util.Collections.singletonList(r)), t);
-        assertEquals(AnchorFillDirection.REVERSE, back.get(0).getFillDirection());
-        assertEquals(AnchorFillDirection.REVERSE, back.get(0).getWrapDirection());
+        AnchorRegion[] back = gson.fromJson(
+                gson.toJson(java.util.Collections.singletonList(r)), AnchorRegion[].class);
+        assertEquals(AnchorFillDirection.REVERSE, back[0].getFillDirection());
+        assertEquals(AnchorFillDirection.REVERSE, back[0].getWrapDirection());
     }
 
     @Test
     public void perAnchorSpacingOverridesGlobalAndDefaultsToIt() {
         Gson gson = new Gson();
-        java.lang.reflect.Type t = new com.google.gson.reflect.TypeToken<java.util.List<AnchorRegion>>() {
-        }.getType();
         AnchorCustomizerPlugin p = new AnchorCustomizerPlugin();
         p.config = new MemConfig(); // global Stack spacing: default 2
 
         // Legacy anchors have no spacing: they follow the global setting, and stay that way when saved.
-        AnchorRegion legacy = gson.<java.util.List<AnchorRegion>>fromJson(
-                "[{\"id\":1,\"name\":\"Box 1\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]", t).get(0);
+        AnchorRegion legacy = gson.fromJson(
+                "[{\"id\":1,\"name\":\"Box 1\",\"x\":0,\"y\":0,\"width\":100,\"height\":100}]", AnchorRegion[].class)[0];
         assertNull(legacy.getSpacing());
         assertEquals(2, p.spacingFor(legacy));
         assertTrue(!gson.toJson(legacy).contains("spacing"));
@@ -208,8 +204,8 @@ public class AnchorFeaturesTest {
         // An anchor's own spacing wins, including 0 (flush), and survives save and profile copies.
         legacy.setSpacing(0);
         assertEquals(0, p.spacingFor(legacy));
-        AnchorRegion back = gson.<java.util.List<AnchorRegion>>fromJson(
-                gson.toJson(java.util.Collections.singletonList(legacy)), t).get(0);
+        AnchorRegion back = gson.fromJson(
+                gson.toJson(java.util.Collections.singletonList(legacy)), AnchorRegion[].class)[0];
         assertEquals(Integer.valueOf(0), back.getSpacing());
         back.setSpacing(7);
         assertEquals(Integer.valueOf(7), back.scaledCopy(2.0).getSpacing());

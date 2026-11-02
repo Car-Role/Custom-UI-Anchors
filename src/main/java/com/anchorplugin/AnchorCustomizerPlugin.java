@@ -24,10 +24,6 @@ import java.awt.Rectangle;
 import java.awt.Window;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
-import java.lang.reflect.InvocationTargetException;
-// java.lang.reflect.Type is the interface returned by TypeToken#getType(); still
-// just Gson plumbing, no reflective member access.
-import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -378,7 +374,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         } else {
             try {
                 SwingUtilities.invokeAndWait(panelInit);
-            } catch (InvocationTargetException | InterruptedException e) {
+            } catch (Exception e) {
                 // Do NOT re-interrupt: startUp() runs on a RuneLite-owned thread
                 // (shared executor / client thread). Re-asserting the interrupt
                 // flag can cause unrelated blocking calls scheduled on this
@@ -913,9 +909,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
 
         try {
-            Type listType = new TypeToken<List<AnchorRegion>>() {
-            }.getType();
-            List<AnchorRegion> loaded = gson.fromJson(json, listType);
+            List<AnchorRegion> loaded = gson.fromJson(json, new TypeToken<List<AnchorRegion>>() {
+            }.getType());
             if (loaded != null) {
                 anchorRegions.addAll(normalizeRegions(loaded));
             }
@@ -977,9 +972,8 @@ public class AnchorCustomizerPlugin extends Plugin {
             return;
         }
         try {
-            Type mapType = new TypeToken<Map<String, List<AnchorRegion>>>() {
-            }.getType();
-            Map<String, List<AnchorRegion>> loaded = gson.fromJson(json, mapType);
+            Map<String, List<AnchorRegion>> loaded = gson.fromJson(json, new TypeToken<Map<String, List<AnchorRegion>>>() {
+            }.getType());
             if (loaded != null) {
                 for (Map.Entry<String, List<AnchorRegion>> e : loaded.entrySet()) {
                     if (e.getKey() != null && e.getValue() != null) {
@@ -2504,9 +2498,8 @@ public class AnchorCustomizerPlugin extends Plugin {
             return;
         }
         try {
-            Type type = new TypeToken<Map<String, Integer>>() {
-            }.getType();
-            Map<String, Integer> loaded = gson.fromJson(json, type);
+            Map<String, Integer> loaded = gson.fromJson(json, new TypeToken<Map<String, Integer>>() {
+            }.getType());
             if (loaded != null) {
                 overlayOrder.clear();
                 overlayOrder.putAll(loaded);
@@ -2522,9 +2515,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (json == null || json.isEmpty())
             return;
         try {
-            Type type = new TypeToken<Map<String, Integer>>() {
-            }.getType();
-            Map<String, Integer> loaded = gson.fromJson(json, type);
+            Map<String, Integer> loaded = gson.fromJson(json, new TypeToken<Map<String, Integer>>() {
+            }.getType());
             if (loaded != null) {
                 overlayAssignments.clear();
                 overlayAssignments.putAll(loaded);
@@ -2964,24 +2956,21 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     /**
      * Build the diagnostics report on the client thread (where the anchor and overlay
-     * state lives) and wait briefly for it. Returns null on failure.
+     * state lives), then hand it to {@code onDone} on the EDT — null on failure. Never
+     * blocks the caller, so the side panel stays responsive.
      */
-    public String buildDiagnosticsReport() {
-        final CompletableFuture<String> result = new CompletableFuture<>();
+    public void buildDiagnosticsReport(Consumer<String> onDone) {
         clientThread.invoke(() -> {
+            String report = null;
             try {
                 flushPendingSaves(true);
-                result.complete(collectDiagnostics());
-            } catch (Throwable t) {
-                result.completeExceptionally(t);
+                report = collectDiagnostics();
+            } catch (Exception e) {
+                log.warn("Building diagnostics failed", e);
             }
+            final String result = report;
+            SwingUtilities.invokeLater(() -> onDone.accept(result));
         });
-        try {
-            return result.get(10, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.warn("Building diagnostics failed", e);
-            return null;
-        }
     }
 
     public void openIssueForm(String report) {
