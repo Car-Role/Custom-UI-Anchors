@@ -74,6 +74,12 @@ public class AnchorCustomizerPanel extends PluginPanel {
 
     private AnchorRegion selectedRegion;
     private boolean isUpdating = false;
+    // Set when the user clicks a constraint arrow: that anchor's pin is then theirs and
+    // the plugin stops picking it automatically.
+    private boolean pinPickedByHand = false;
+
+    // "Restore old layout" submenu; only shown when there are old layouts to restore.
+    private final javax.swing.JMenu restoreMenu;
 
     public AnchorCustomizerPanel(AnchorCustomizerPlugin plugin) {
         super();
@@ -99,13 +105,20 @@ public class AnchorCustomizerPanel extends PluginPanel {
         ioPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         JPopupMenu ioMenu = new JPopupMenu();
         JMenuItem exportItem = new JMenuItem("Export layout");
-        exportItem.setToolTipText("Copy all anchors, profiles and overlay assignments to the clipboard as JSON.");
+        exportItem.setToolTipText("Copy all anchors and overlay assignments to the clipboard as JSON.");
         exportItem.addActionListener(e -> exportLayout());
         JMenuItem importItem = new JMenuItem("Import layout");
-        importItem.setToolTipText("Replace all anchors, profiles and overlay assignments with a layout JSON on the clipboard.");
+        importItem.setToolTipText("Replace all anchors and overlay assignments with a layout JSON on the clipboard.");
         importItem.addActionListener(e -> importLayout());
+        // Old layouts: the per-monitor layouts of older plugin versions, and the layout
+        // replaced by the last restore. Filled by updateOldLayouts.
+        restoreMenu = new javax.swing.JMenu("Restore old layout");
+        restoreMenu.setToolTipText("<html>Older versions kept a separate layout for each monitor. The plugin now uses<br>"
+                + "one layout everywhere; the others are kept here so you can bring one back.</html>");
+        restoreMenu.setVisible(false);
         ioMenu.add(exportItem);
         ioMenu.add(importItem);
+        ioMenu.add(restoreMenu);
         JButton ioButton = new JButton("Export / Import");
         ioButton.setToolTipText("Copy your layout to the clipboard, or load one from it.");
         ioButton.addActionListener(e -> ioMenu.show(ioButton, 0, ioButton.getHeight()));
@@ -214,8 +227,10 @@ public class AnchorCustomizerPanel extends PluginPanel {
         c.gridy++;
         JLabel constraintLabel = new JLabel("Constraint:");
         constraintLabel.setToolTipText(
-                "Which part of the game window this anchor pins to. When the window is resized, "
-                        + "the anchor stays glued to the chosen corner / edge / center.");
+                "<html>Which part of the game window this anchor pins to. When the window changes size,<br>"
+                        + "the anchor keeps its distance to that corner / edge / center.<br>"
+                        + "The plugin picks the nearest one each time you move the box.<br>"
+                        + "Click an arrow to pick it yourself: the plugin then leaves this anchor's pin alone.</html>");
         propertiesPanel.add(constraintLabel, c);
         c.gridy++;
         AnchorConstraint[] constraintGrid = {
@@ -236,7 +251,13 @@ public class AnchorCustomizerPanel extends PluginPanel {
         };
         constraintPicker = new ArrowGridPicker<>(constraintGrid, constraintCellTips);
         constraintPicker.setToolTipText(constraintLabel.getToolTipText());
-        constraintPicker.setOnChange(v -> saveChanges());
+        // onChange only fires for a user click (not for setSelectedValue): a pin picked
+        // by hand is kept, and the plugin never re-pins that anchor again.
+        constraintPicker.setOnChange(v -> {
+            if (isUpdating) return;
+            pinPickedByHand = true;
+            saveChanges();
+        });
         propertiesPanel.add(constraintPicker, c);
 
         // Alignment picker (3x3 grid)
@@ -658,6 +679,8 @@ public class AnchorCustomizerPanel extends PluginPanel {
         AnchorConstraint newConstraint = constraintPicker.getSelectedValue();
         if (newConstraint == null) newConstraint = AnchorConstraint.TOP_LEFT;
         final AnchorConstraint finalConstraint = newConstraint;
+        final boolean pickedByHand = pinPickedByHand;
+        pinPickedByHand = false;
 
         AnchorAlignment picked = alignmentPicker.getSelectedValue();
         final AnchorAlignment newAlignment = picked != null ? picked : AnchorAlignment.CENTER;
@@ -678,6 +701,9 @@ public class AnchorCustomizerPanel extends PluginPanel {
             r.setWidth(newW);
             r.setHeight(newH);
             r.setConstraint(finalConstraint);
+            if (pickedByHand) {
+                r.setManualPin(true);
+            }
             r.setAlignment(newAlignment);
             r.setStacking(newStacking);
             r.setFillDirection(newFillDirection);
@@ -719,12 +745,38 @@ public class AnchorCustomizerPanel extends PluginPanel {
             return;
         }
         int choice = JOptionPane.showConfirmDialog(this,
-                "This replaces ALL anchors, profiles and overlay assignments in the current RuneLite profile. Continue?",
+                "This replaces ALL anchors and overlay assignments in the current RuneLite profile. Continue?",
                 "Import layout", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
         if (choice != JOptionPane.OK_OPTION) {
             return;
         }
         plugin.applyLayoutImport(text);
+    }
+
+    /**
+     * Fill the "Restore old layout" submenu. Each entry is an old layout's id and its
+     * label (name and anchor count); the submenu is hidden when there are none.
+     */
+    public void updateOldLayouts(List<String> ids, List<String> labels) {
+        restoreMenu.removeAll();
+        for (int i = 0; i < ids.size(); i++) {
+            final String id = ids.get(i);
+            final String label = labels.get(i);
+            JMenuItem item = new JMenuItem(label);
+            item.addActionListener(e -> restoreOldLayout(id, label));
+            restoreMenu.add(item);
+        }
+        restoreMenu.setVisible(!ids.isEmpty());
+    }
+
+    private void restoreOldLayout(String id, String label) {
+        int choice = JOptionPane.showConfirmDialog(this,
+                "Replace your anchors (in resizable mode) with the old layout \"" + label + "\"?\n"
+                        + "Your current layout is kept in this menu as \"Layout before the last restore\".",
+                "Restore old layout", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (choice == JOptionPane.OK_OPTION) {
+            plugin.restoreOldLayout(id);
+        }
     }
 
     private void deleteSelectedRegion() {

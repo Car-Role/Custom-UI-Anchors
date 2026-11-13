@@ -89,7 +89,51 @@ public class AnchorCustomizerOverlay extends Overlay {
             drawAnchorRegion(graphics, region, isDraggingThis, isHovering, editActive);
         }
 
+        // Pin line: where the box is pinned — or, during a drag, where it will be pinned
+        // when dropped (the plugin picks the nearest corner / edge / centre on drop
+        // unless the user set the pin by hand). Shown for the dragged box, else for the
+        // box under the pointer while the edit hotkey is held.
+        if (plugin.getConfig().showPinIndicator()) {
+            AnchorRegion shown = draggingAnchor != null ? draggingAnchor : (editActive ? hoverTarget : null);
+            // A chat-pinned box follows the chatbox vertically, not this pin: no line.
+            if (shown != null && !shown.isDisabled() && !shown.isPinToChat()) {
+                AnchorConstraint pin = draggingAnchor != null
+                        ? plugin.pinIfDroppedNow(shown)
+                        : (shown.getConstraint() != null ? shown.getConstraint() : AnchorConstraint.TOP_LEFT);
+                drawPinIndicator(graphics, shown.getBounds(), pin,
+                        draggingAnchor != null ? ANCHOR_DRAGGING_COLOR : Color.YELLOW);
+            }
+        }
+
         return null;
+    }
+
+    // Marker size and how far it sits in from the canvas edge so it is never cut off.
+    private static final int PIN_DOT_RADIUS = 3;
+    private static final int PIN_DOT_INSET = 5;
+
+    /**
+     * A thin line from the box's corner / edge midpoint / centre to the matching point
+     * of the game window, with a small dot on the window's point.
+     */
+    private void drawPinIndicator(Graphics2D graphics, Rectangle box, AnchorConstraint pin, Color color) {
+        Rectangle canvas = plugin.getViewportBounds();
+        if (canvas == null || canvas.width <= 0 || canvas.height <= 0) {
+            return;
+        }
+        java.awt.Point from = pin.boxPoint(box);
+        java.awt.Point to = pin.canvasPoint(canvas.width, canvas.height, PIN_DOT_INSET);
+
+        java.awt.Stroke oldStroke = graphics.getStroke();
+        Object oldHint = graphics.getRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING);
+        graphics.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+        graphics.setStroke(new BasicStroke(1));
+        graphics.setColor(color);
+        graphics.drawLine(from.x, from.y, to.x, to.y);
+        graphics.fillOval(to.x - PIN_DOT_RADIUS, to.y - PIN_DOT_RADIUS, 2 * PIN_DOT_RADIUS + 1, 2 * PIN_DOT_RADIUS + 1);
+        graphics.setStroke(oldStroke);
+        graphics.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+                oldHint != null ? oldHint : java.awt.RenderingHints.VALUE_ANTIALIAS_DEFAULT);
     }
 
     private void drawAnchorRegion(Graphics2D graphics, AnchorRegion region, boolean isDragging, boolean isHovering,

@@ -8,7 +8,8 @@ https://github.com/user-attachments/assets/7ba959b9-2887-45c4-9f86-2a4a2857afd0
 ## Features
 
 - **Custom anchor boxes**: Create any number of anchor regions and drag overlays into them to group them
-- **Window-resize constraints**: Pin each box to a corner, edge, or the center so it stays put when RuneLite is resized
+- **Window-resize constraints**: Each box is pinned to a corner, edge, or the center so it stays put when RuneLite is resized. The plugin picks the nearest one when you drop a box (a thin line shows which), or you can pick it yourself in the side panel
+- **One layout everywhere**: The same layout is used at every window size and on every monitor. Fixed (classic) mode keeps its own layout
 - **Alignment & stacking**: Control where overlays sit inside a box and how multiple overlays stack (vertical, horizontal, or wrapping fill)
 - **Live editing**: Hold Alt in-game to see and drag anchor boxes; edit position, size, and behavior from the side panel
 

@@ -41,42 +41,48 @@ public interface AnchorCustomizerConfig extends Config {
         return AnchorVisibility.HOTKEY_HELD;
     }
 
+    @ConfigItem(keyName = "showPinIndicator", name = "Show pin line", description = "While you drag an anchor box, or point at one with the drag hotkey held, draw a thin line from the box to the corner, edge or center of the game window it is pinned to. The box keeps its distance to that point when the window changes size. The plugin picks the pin when you drop the box, unless you set it yourself in the side panel.", position = 6)
+    default boolean showPinIndicator() {
+        return true;
+    }
+
     @ConfigItem(keyName = "debugLogging", name = "Debug logging", description = "To report a problem, use Copy diagnostics or Report issue on GitHub in the side panel (under \"Having a problem?\"). Turn this on only if asked: it writes extra details to client.log while you reproduce the problem (find it with Copy logs folder path in the side panel).", position = 11, section = reportSection)
     default boolean debugLogging() {
         return false;
     }
 
-    @ConfigItem(keyName = "regionJson", name = "Region Data", description = "Internal storage for region data", hidden = true)
+    // All layouts (anchors, overlay assignments and order per layout) plus which layout
+    // each computer selected. This is the only layout data the plugin writes.
+    @ConfigItem(keyName = "layouts", name = "Layouts", description = "Internal storage for the named layouts", hidden = true)
+    default String layoutsJson() {
+        return "";
+    }
+
+    @ConfigItem(keyName = "layouts", name = "Layouts", description = "Internal storage for the named layouts", hidden = true)
+    void setLayoutsJson(String json);
+
+    // ---- Data from before named layouts existed. Read once to build the layouts, then
+    // never written again (no setters), so it stays in config as the backup. ----
+
+    @ConfigItem(keyName = "regionJson", name = "Region Data", description = "Old internal storage for region data (read-only backup)", hidden = true)
     default String regionJson() {
         return "[]";
     }
 
-    @ConfigItem(keyName = "regionJson", name = "Region Data", description = "Internal storage for region data", hidden = true)
-    void setRegionJson(String json);
-
-    @ConfigItem(keyName = "regionProfiles", name = "Region Profiles", description = "Internal storage for per-resolution region layout profiles", hidden = true)
+    @ConfigItem(keyName = "regionProfiles", name = "Region Profiles", description = "Old internal storage for per-monitor layout profiles (read-only backup)", hidden = true)
     default String regionProfilesJson() {
         return "{}";
     }
 
-    @ConfigItem(keyName = "regionProfiles", name = "Region Profiles", description = "Internal storage for per-resolution region layout profiles", hidden = true)
-    void setRegionProfilesJson(String json);
-
-    @ConfigItem(keyName = "overlayAssignments", name = "Overlay Assignments", description = "Internal storage for overlay assignments", hidden = true)
+    @ConfigItem(keyName = "overlayAssignments", name = "Overlay Assignments", description = "Old internal storage for overlay assignments (read-only backup)", hidden = true)
     default String overlayAssignmentsJson() {
         return "{}";
     }
 
-    @ConfigItem(keyName = "overlayAssignments", name = "Overlay Assignments", description = "Internal storage for overlay assignments", hidden = true)
-    void setOverlayAssignmentsJson(String json);
-
-    @ConfigItem(keyName = "overlayOrder", name = "Overlay Order", description = "Internal storage for overlay ordering within regions", hidden = true)
+    @ConfigItem(keyName = "overlayOrder", name = "Overlay Order", description = "Old internal storage for overlay ordering within regions (read-only backup)", hidden = true)
     default String overlayOrderJson() {
         return "{}";
     }
-
-    @ConfigItem(keyName = "overlayOrder", name = "Overlay Order", description = "Internal storage for overlay ordering within regions", hidden = true)
-    void setOverlayOrderJson(String json);
 
     @ConfigItem(keyName = "selectedRegionId", name = "Selected Region Id", description = "Internal storage for the last selected anchor region in the panel", hidden = true)
     default int selectedRegionId() {

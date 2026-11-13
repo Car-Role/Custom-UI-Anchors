@@ -181,7 +181,8 @@ public class AnchorFeaturesTest {
         // REVERSE round-trips through serialization.
         AnchorRegion r = new AnchorRegion(2, "Box 2", 0, 0, 100, 100,
                 AnchorConstraint.TOP_LEFT, AnchorAlignment.CENTER, AnchorStacking.FILL_VERTICAL,
-                false, 0, 0, 765, 503, false, AnchorFillDirection.REVERSE, AnchorFillDirection.REVERSE, false, 0, null);
+                false, 0, 0, 765, 503, false, AnchorFillDirection.REVERSE, AnchorFillDirection.REVERSE, false, 0, null,
+                false);
         AnchorRegion[] back = gson.fromJson(
                 gson.toJson(java.util.Collections.singletonList(r)), AnchorRegion[].class);
         assertEquals(AnchorFillDirection.REVERSE, back[0].getFillDirection());
@@ -231,63 +232,53 @@ public class AnchorFeaturesTest {
     /** Minimal in-memory config; default methods cover everything we don't override. */
     private static final class MemConfig implements AnchorCustomizerConfig {
         boolean drawAbove = true;
-        String regions = "[]";
-        String profiles = "{}";
-        String assignments = "{}";
-        String order = "{}";
+        String layouts = "";
 
-        @Override public String regionJson() { return regions; }
-        @Override public void setRegionJson(String json) { regions = json; }
-        @Override public String regionProfilesJson() { return profiles; }
-        @Override public void setRegionProfilesJson(String json) { profiles = json; }
-        @Override public String overlayAssignmentsJson() { return assignments; }
-        @Override public void setOverlayAssignmentsJson(String json) { assignments = json; }
-        @Override public String overlayOrderJson() { return order; }
-        @Override public void setOverlayOrderJson(String json) { order = json; }
+        @Override public String layoutsJson() { return layouts; }
+        @Override public void setLayoutsJson(String json) { layouts = json; }
         @Override public void setSelectedRegionId(int id) { }
         @Override public boolean drawAboveInterfaces() { return drawAbove; }
     }
 
     @Test
-    public void exportImportRoundTripPreservesBlobs() {
+    public void exportImportRoundTripPreservesTheLayout() {
         Gson gson = new Gson();
-        MemConfig cfg = new MemConfig();
-        cfg.regions = gson.toJson(java.util.Collections.singletonList(
+        AnchorCustomizerPlugin p = new AnchorCustomizerPlugin();
+        p.gson = gson;
+        p.config = new MemConfig();
+        p.overlayScanHandler = pred -> { /* no overlays in test */ };
+
+        // Start from an export of the per-monitor profile era (version 1): it must still import.
+        String regions = gson.toJson(java.util.Collections.singletonList(
                 new AnchorRegion(1, "Box 1", 10, 20, 100, 100,
                         AnchorConstraint.TOP_LEFT, AnchorAlignment.CENTER,
                         AnchorStacking.VERTICAL, false, 10, 20, 765, 503,
-                        false, AnchorFillDirection.FORWARD, AnchorFillDirection.FORWARD, false, 0, null)));
-        cfg.profiles = "{\"fixed\":[]}";
-        cfg.assignments = "{\"someOverlay\":1}";
-        cfg.order = "{\"someOverlay\":0}";
+                        false, AnchorFillDirection.FORWARD, AnchorFillDirection.FORWARD, false, 0, null, false)));
+        String oldExport = "{\"format\":\"custom-ui-anchors\",\"version\":1,\"regionJson\":" + regions
+                + ",\"regionProfiles\":{\"fixed\":[]},\"overlayAssignments\":{\"someOverlay\":1},"
+                + "\"overlayOrder\":{\"someOverlay\":0}}";
+        assertNull(p.checkLayoutImport(oldExport));
+        p.applyLayoutImportOnClientThread(gson.fromJson(oldExport, JsonElement.class).getAsJsonObject());
+        assertEquals(1, p.anchorRegions.size());
+        assertEquals("Box 1", p.anchorRegions.get(0).getName());
 
-        String expectedRegions = canonical(gson, cfg.regions);
-        String exported = AnchorCustomizerPlugin.buildExportJson(gson, cfg);
-
-        // Simulate the user having changed everything since the export.
-        cfg.regions = "[]";
-        cfg.profiles = "{}";
-        cfg.assignments = "{}";
-        cfg.order = "{}";
-
-        AnchorCustomizerPlugin p = new AnchorCustomizerPlugin();
-        p.gson = gson;
-        p.config = cfg;
-        p.overlayScanHandler = pred -> { /* no overlays in test */ };
+        // Export in the current format, wipe everything, import it back.
+        String exported = p.buildExportJson(gson);
+        p.applyLayoutImportOnClientThread(gson.fromJson(
+                "{\"format\":\"custom-ui-anchors\",\"version\":2,\"layout\":{\"regions\":[]}}", JsonElement.class)
+                .getAsJsonObject());
+        assertEquals(0, p.anchorRegions.size());
 
         assertNull(p.checkLayoutImport(exported));
         p.applyLayoutImportOnClientThread(gson.fromJson(exported, JsonElement.class).getAsJsonObject());
-
-        // All four blobs are restored (canonical Gson form — the inputs above were
-        // already gson-serialized, so round-tripping is byte-identical).
-        assertEquals(expectedRegions, cfg.regions);
-        assertEquals("{\"fixed\":[]}", cfg.profiles);
-        assertEquals("{\"someOverlay\":1}", cfg.assignments);
-        assertEquals("{\"someOverlay\":0}", cfg.order);
-    }
-
-    private static String canonical(Gson gson, String json) {
-        return gson.toJson(gson.fromJson(json, JsonElement.class));
+        assertEquals(1, p.anchorRegions.size());
+        AnchorRegion back = p.anchorRegions.get(0);
+        assertEquals("Box 1", back.getName());
+        assertEquals(new Rectangle(10, 20, 100, 100), back.getBounds());
+        assertEquals(Integer.valueOf(1), p.store.main.getAssignments().get("someOverlay"));
+        assertEquals(Integer.valueOf(0), p.store.main.getOrder().get("someOverlay"));
+        // The import is saved under the one key the plugin writes.
+        assertTrue(((MemConfig) p.config).layouts.contains("Box 1"));
     }
 
     // ---- Drag-race fix (origin normalization vs renderer drag) ---------------------
@@ -490,7 +481,9 @@ public class AnchorFeaturesTest {
         assertTrue(p.checkLayoutImport("not json") != null);
         assertTrue(p.checkLayoutImport("[1,2]") != null);
         assertTrue(p.checkLayoutImport("{\"format\":\"other\",\"version\":1}") != null);
-        assertTrue(p.checkLayoutImport("{\"format\":\"custom-ui-anchors\",\"version\":2}") != null);
+        assertTrue(p.checkLayoutImport("{\"format\":\"custom-ui-anchors\",\"version\":3}") != null);
+        // Both the old (1) and the current (2) export versions import.
         assertNull(p.checkLayoutImport("{\"format\":\"custom-ui-anchors\",\"version\":1}"));
+        assertNull(p.checkLayoutImport("{\"format\":\"custom-ui-anchors\",\"version\":2}"));
     }
 }

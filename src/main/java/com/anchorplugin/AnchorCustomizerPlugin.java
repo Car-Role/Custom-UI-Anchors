@@ -45,6 +45,7 @@ import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.BeforeRender;
@@ -148,41 +149,34 @@ public class AnchorCustomizerPlugin extends Plugin {
     final List<AnchorRegion> anchorRegions = new ArrayList<>();
     private Dimension lastViewport = null;
 
-    // ---- Resolution profile system -------------------------------------------------
+    // ---- Layouts --------------------------------------------------------------------
     //
-    // Region geometry is stored per layout profile so machines with different monitors
-    // (synced through one RuneLite config) stop overwriting each other's layouts.
+    // anchorRegions, overlayAssignments and overlayOrder are the LIVE copy of the active
+    // layout; saves fold them back into it (see LayoutStore for what is stored).
     //
-    // Profile keys:
-    //   "fixed"      — fixed client mode. The game canvas is always 765x503 in fixed
-    //                  mode (even under Stretched Mode, since getRealDimensions() is
-    //                  pre-stretch), so this single profile is pixel-perfect on every
-    //                  machine with no scaling.
-    //   "<W>x<H>"    — resizable mode, keyed by the monitor's display-mode resolution
-    //                  (NOT the canvas size — window resizes within one monitor stay in
-    //                  one profile and are handled by the origin-derivation tick loop).
-    //
-    // Every monitor resolution is a fully INDEPENDENT profile storing absolute pixel
-    // geometry — edits on one monitor never propagate to another. (An earlier design
-    // shared one scaled canonical across integer-related resolutions, e.g. 1080p/4K at
-    // x2; that assumed the canvas scales with the monitor, which is false when a
-    // fixed-size window is dragged across monitors, and its shared write-back clobbered
-    // sibling layouts. See GitHub issue on multi-resolution setups.) A brand-new
-    // profile gets a one-time seed from the outgoing live layout, scaled by the
-    // OBSERVED canvas dimension change across the swap — an exact copy when the window
-    // wasn't resized — and is on its own track thereafter.
-    private final Map<String, List<AnchorRegion>> profileLayouts = new HashMap<>();
-    private String activeProfileKey = null;
-    private String lastWrittenProfilesJson = null;
+    // Resizable mode has ONE layout, used at every window size and on every monitor:
+    // each anchor's position is derived from its pin (constraint) and the canvas size
+    // (recomputePosition). Fixed mode has its own layout. The live layout therefore
+    // changes for one reason only — the client goes between fixed and resizable mode,
+    // which the user does on purpose and client.isResized() reports reliably. The
+    // monitor is never consulted: older versions swapped a hidden per-monitor layout on
+    // what AWT reported, and a wrong or momentary report swapped in a stale layout
+    // (GitHub issue #28).
+    LayoutStore store = new LayoutStore();
+    AnchorLayout activeLayout = null;
+    // False until a logged-in tick has shown a layout for the real client mode and
+    // canvas size; the startup materialization only feeds the panel and login screen.
+    private boolean liveResolved = false;
+    // Ticks spent waiting for AWT screen info for the one-time monitor pick.
+    private int legacyPickAttempts = 0;
+    private static final int LEGACY_PICK_MAX_ATTEMPTS = 100;
+    private String lastWrittenLayoutsJson = null;
 
-    private static final String FIXED_PROFILE_KEY = "fixed";
-
-    // Set by AWT when the canvas moves to another screen. The profile re-check calls
-    // GraphicsDevice.getDisplayMode(), which on X11 with the NVIDIA driver forces a
-    // full randr re-probe of every output, so it must not run on a timer.
-    private volatile boolean displayChanged = true;
-    private java.awt.Canvas watchedCanvas;
-    private final java.beans.PropertyChangeListener displayChangeListener = e -> displayChanged = true;
+    // Test seams (the client is null in unit tests).
+    Supplier<Boolean> resizedSupplier = () -> client.isResized();
+    Supplier<Dimension> canvasDimSupplier = () -> client.getCanvas() == null ? null : client.getRealDimensions();
+    Supplier<String> legacyDisplayKeySupplier = this::legacyDisplayKey;
+    Consumer<String> noticeHandler = msg -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, null);
 
     // The RuneLite canvas frequently resizes once during the first few hundred ms of
     // plugin life, and again whenever the user transitions between login-screen (fixed
@@ -211,11 +205,8 @@ public class AnchorCustomizerPlugin extends Plugin {
     private boolean regionsDirty = false;
     private boolean assignmentsDirty = false;
     private boolean orderDirty = false;
-    private boolean profilesDirty = false;
+    private boolean layoutsDirty = false;
     private long lastFlushTime = 0L;
-    private String lastWrittenRegionJson = null;
-    private String lastWrittenAssignmentsJson = null;
-    private String lastWrittenOrderJson = null;
 
     // Periodic re-acquire throttle for overlays that load after startup
     private long lastReacquireTime = 0L;
@@ -325,12 +316,10 @@ public class AnchorCustomizerPlugin extends Plugin {
         // Reset cached state in case RuneLite is reusing this plugin instance across an
         // enable/disable cycle. Without this, a stale "last written" string could silently
         // suppress a legitimate ConfigChanged reload after re-enable.
-        lastWrittenRegionJson = null;
-        lastWrittenAssignmentsJson = null;
-        lastWrittenProfilesJson = null;
-        activeProfileKey = null;
-        profileLayouts.clear();
-        displayChanged = true;
+        lastWrittenLayoutsJson = null;
+        activeLayout = null;
+        liveResolved = false;
+        legacyPickAttempts = 0;
         lastViewport = null;
         startupTimeMs = System.currentTimeMillis();
         lastResizeTime = 0L;
@@ -341,7 +330,8 @@ public class AnchorCustomizerPlugin extends Plugin {
         lastMouseY = Integer.MIN_VALUE;
         regionsDirty = false;
         assignmentsDirty = false;
-        profilesDirty = false;
+        orderDirty = false;
+        layoutsDirty = false;
         needsSnap = false;
         navButtonAdded = false;
 
@@ -433,40 +423,20 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (startupCanvas != null) {
             startupCanvas.setCursor(null);
         }
-        // loadRegions materializes the legacy "last live layout" snapshot so the panel
-        // and login-screen overlays behave exactly as before. The first logged-in tick
-        // resolves the actual layout profile (fixed mode / monitor resolution) and swaps
-        // in its stored geometry via switchProfile.
-        loadRegions();
-        loadProfiles();
-        loadOverlayAssignments();
-        loadOverlayOrder();
+        // Load the layouts (older data is migrated once) and show this computer's
+        // selected layout, so the panel and login screen have anchors. The first
+        // logged-in tick then shows the layout for the real client mode and canvas size.
+        loadLayouts();
 
         // Try to re-acquire overlay references for persisted assignments
         scanAndReacquireOverlays();
         lastReacquireTime = System.currentTimeMillis();
         events.add("Plugin started: " + anchorRegions.size() + " anchors, " + overlayAssignments.size()
-                + " assigned overlays, " + profileLayouts.size() + " stored layout profiles");
+                + " assigned overlays, layouts: " + layoutSummary());
 
-        // Update panel and restore the last-selected region (Fix SEL).
-        final List<AnchorRegion> snapshot = new ArrayList<>(anchorRegions);
-        final int persistedSelectedId = config.selectedRegionId();
-        AnchorRegion restored = null;
-        if (persistedSelectedId >= 0) {
-            for (AnchorRegion r : snapshot) {
-                if (r.getId() == persistedSelectedId) {
-                    restored = r;
-                    break;
-                }
-            }
-        }
-        final AnchorRegion restoredFinal = restored;
-        SwingUtilities.invokeLater(() -> {
-            panel.updateList(snapshot);
-            if (restoredFinal != null) {
-                panel.setSelectedRegion(restoredFinal);
-            }
-        });
+        // Update the panel (layout choices, anchor list) and restore the last-selected
+        // region (Fix SEL).
+        refreshPanel();
     }
 
     @Override
@@ -482,10 +452,9 @@ public class AnchorCustomizerPlugin extends Plugin {
             clientToolbar.removeNavigation(navButton);
             navButtonAdded = false;
         }
-        unwatchCanvas();
         anchorRegions.clear();
-        profileLayouts.clear();
-        activeProfileKey = null;
+        activeLayout = null;
+        liveResolved = false;
         trackedOverlays.clear();
         overlayAssignments.clear();
         overlayOrder.clear();
@@ -503,67 +472,14 @@ public class AnchorCustomizerPlugin extends Plugin {
             events.add("Setting changed: " + event.getKey() + " = " + event.getNewValue());
         }
 
-        if (event.getKey().equals("regionJson")) {
+        if (event.getKey().equals("layouts")) {
             String incoming = event.getNewValue();
             // Suppress self-triggered reloads when the value matches what we just wrote
-            if (incoming != null && incoming.equals(lastWrittenRegionJson)) {
+            if (incoming != null && incoming.equals(lastWrittenLayoutsJson)) {
                 return;
             }
-            clientThread.invoke(() -> {
-                // Once the profile system owns the layout, remote regionJson writes are
-                // just another machine's back-compat "last live layout" snapshot — its
-                // canvas/monitor context, not ours. Reloading it here is exactly the
-                // cross-machine clobbering the profiles exist to prevent, so ignore it.
-                // Pure-legacy sessions (no profiles yet) keep the old reload behavior.
-                if (activeProfileKey != null || !profileLayouts.isEmpty()) {
-                    return;
-                }
-                loadRegions();
-                final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
-                SwingUtilities.invokeLater(() -> panel.updateList(snap));
-            });
-        } else if (event.getKey().equals("regionProfiles")) {
-            String incoming = event.getNewValue();
-            if (incoming != null && incoming.equals(lastWrittenProfilesJson)) {
-                return;
-            }
-            clientThread.invoke(() -> {
-                // Remote profile update (another machine edited some profile). Reload the
-                // map; if our active profile's stored layout changed, re-materialize it.
-                loadProfiles();
-                if (activeProfileKey == null) {
-                    return;
-                }
-                List<AnchorRegion> stored = profileLayouts.get(activeProfileKey);
-                if (stored == null) {
-                    return;
-                }
-                List<AnchorRegion> live = deepCopy(stored);
-                live = normalizeRegions(live);
-                anchorRegions.clear();
-                anchorRegions.addAll(live);
-                Rectangle vp = getViewportBounds();
-                if (vp != null && vp.width > 0 && vp.height > 0) {
-                    for (AnchorRegion r : anchorRegions) {
-                        recomputePosition(r, vp.getSize());
-                    }
-                }
-                requestSnap();
-                final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
-                SwingUtilities.invokeLater(() -> panel.updateList(snap));
-            });
-        } else if (event.getKey().equals("overlayAssignments")) {
-            String incoming = event.getNewValue();
-            if (incoming != null && incoming.equals(lastWrittenAssignmentsJson)) {
-                return;
-            }
-            clientThread.invoke(this::loadOverlayAssignments);
-        } else if (event.getKey().equals("overlayOrder")) {
-            String incoming = event.getNewValue();
-            if (incoming != null && incoming.equals(lastWrittenOrderJson)) {
-                return;
-            }
-            clientThread.invoke(this::loadOverlayOrder);
+            // Written by something else (e.g. another computer through config sync).
+            clientThread.invoke(this::reloadLayoutsFromConfig);
         } else if (event.getKey().equals("showSidebarButton")) {
             SwingUtilities.invokeLater(this::syncSidebarButton);
         } else if (event.getKey().equals("drawAboveInterfaces")) {
@@ -601,19 +517,16 @@ public class AnchorCustomizerPlugin extends Plugin {
         clientThread.invoke(this::createNewAnchorOnClientThread);
     }
 
-    private void createNewAnchorOnClientThread() {
-        int nextId = 1;
-        List<Integer> ids = new ArrayList<>();
-        for (AnchorRegion r : anchorRegions)
-            ids.add(r.getId());
-        Collections.sort(ids);
-
-        // Find gap or next
-        for (int id : ids) {
-            if (id == nextId)
-                nextId++;
-            else
-                break;
+    void createNewAnchorOnClientThread() {
+        // Ids are never reused inside a layout, so a new anchor can never inherit
+        // something (an overlay assignment, a stale reference) that pointed at a
+        // deleted one.
+        int nextId = activeLayout != null ? activeLayout.getNextRegionId() : 1;
+        for (AnchorRegion r : anchorRegions) {
+            nextId = Math.max(nextId, r.getId() + 1);
+        }
+        if (activeLayout != null) {
+            activeLayout.setNextRegionId(nextId + 1);
         }
 
         Rectangle viewport = getViewportBounds();
@@ -641,7 +554,10 @@ public class AnchorCustomizerPlugin extends Plugin {
                 AnchorFillDirection.FORWARD,
                 false,
                 0,
-                null);
+                null,
+                false);
+        // Pin to the nearest corner / edge / centre (the centre, for a new box).
+        applyAutoPin(region);
         rebaselineOrigin(region);
 
         anchorRegions.add(region);
@@ -649,7 +565,9 @@ public class AnchorCustomizerPlugin extends Plugin {
         events.add("Created anchor " + nextId + " at " + x + "," + y);
         selectAnchor(region);
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
-        SwingUtilities.invokeLater(() -> panel.updateList(snap));
+        SwingUtilities.invokeLater(() -> {
+            if (panel != null) panel.updateList(snap);
+        });
     }
 
     /**
@@ -657,7 +575,7 @@ public class AnchorCustomizerPlugin extends Plugin {
      * Index 0 is the TOP of the layer stack: it is drawn last by the customizer
      * overlay and picked first by the input listener. The list order is persisted via
      * {@link #saveRegions()} (it's simply the JSON array order), so layering survives
-     * restarts and is stored per resolution profile.
+     * restarts and is stored per layout.
      */
     public void moveRegionToIndex(AnchorRegion region, int targetIndex) {
         if (region == null) return;
@@ -701,12 +619,16 @@ public class AnchorCustomizerPlugin extends Plugin {
         if (config.selectedRegionId() != id) {
             config.setSelectedRegionId(id);
         }
-        SwingUtilities.invokeLater(() -> panel.setSelectedRegion(region));
+        SwingUtilities.invokeLater(() -> {
+            if (panel != null) panel.setSelectedRegion(region);
+        });
     }
 
     /** Lightweight panel-properties refresh (no JList mutation). */
     public void refreshSelectedAnchorProperties(AnchorRegion region) {
-        SwingUtilities.invokeLater(() -> panel.refreshSelectedRegionProperties(region));
+        SwingUtilities.invokeLater(() -> {
+            if (panel != null) panel.refreshSelectedRegionProperties(region);
+        });
     }
 
     /**
@@ -716,14 +638,83 @@ public class AnchorCustomizerPlugin extends Plugin {
      */
     public void updateRegion(AnchorRegion region, java.util.function.Consumer<AnchorRegion> updater) {
         if (region == null || updater == null) return;
-        clientThread.invoke(() -> {
-            updater.accept(region);
-            // Any panel commit (X/Y/W/H spinner, constraint, alignment, stacking, name)
-            // counts as a user-confirmed geometry. Rebaseline the origin so subsequent
-            // window resizes are derived from this state, not the pre-edit state.
+        clientThread.invoke(() -> applyRegionUpdate(region, updater));
+    }
+
+    void applyRegionUpdate(AnchorRegion region, java.util.function.Consumer<AnchorRegion> updater) {
+        Rectangle before = region.getBounds();
+        AnchorConstraint pinBefore = region.getConstraint();
+        boolean chatBefore = region.isPinToChat();
+
+        updater.accept(region);
+
+        boolean moved = !before.equals(region.getBounds());
+        // Automatic pin: moving the box (X/Y/W/H) re-pins it, exactly like a drop on
+        // the canvas. An anchor whose pin the user set by hand is never re-pinned.
+        if (!region.isManualPin() && moved) {
+            applyAutoPin(region);
+        }
+        boolean pinChanged = pinBefore != region.getConstraint() || chatBefore != region.isPinToChat();
+        // A geometry or pin commit is a user-confirmed position: rebaseline the origin
+        // so later window resizes derive from it. Other edits (name, stacking, spacing,
+        // ...) leave the origin alone — the live position can differ from it while the
+        // box is held on a small canvas (keepOnCanvas), and must not be baked in.
+        if (moved || pinChanged || region.getOriginW() <= 0) {
             rebaselineOrigin(region);
-            saveRegions();
-        });
+        }
+        saveRegions();
+        if (pinBefore != region.getConstraint()) {
+            refreshSelectedAnchorProperties(region);
+        }
+    }
+
+    /** Pin a box to the nearest corner / edge / centre of the canvas. No-op without a canvas size. */
+    private void applyAutoPin(AnchorRegion region) {
+        Rectangle viewport = getViewportBounds();
+        if (viewport == null || viewport.width <= 0 || viewport.height <= 0) {
+            return;
+        }
+        region.setConstraint(AnchorConstraint.nearest(region.getBounds(), viewport.width, viewport.height));
+    }
+
+    /**
+     * The pin an anchor gets if it is dropped where it is right now: the nearest
+     * corner / edge / centre for an automatic anchor, its own constraint when the user
+     * set the pin by hand. Drawn by the pin indicator during a drag.
+     */
+    public AnchorConstraint pinIfDroppedNow(AnchorRegion region) {
+        AnchorConstraint current = region.getConstraint() != null ? region.getConstraint() : AnchorConstraint.TOP_LEFT;
+        if (region.isManualPin()) {
+            return current;
+        }
+        Rectangle viewport = getViewportBounds();
+        if (viewport == null || viewport.width <= 0 || viewport.height <= 0) {
+            return current;
+        }
+        return AnchorConstraint.nearest(region.getBounds(), viewport.width, viewport.height);
+    }
+
+    /**
+     * Commit an anchor the user just dropped (drag or edge-resize end): pick its pin
+     * (unless the user set one by hand), rebaseline its origin and save. Safe from any
+     * thread — marshals onto the client thread where {@code anchorRegions} is mutated.
+     */
+    public void commitAnchorEditFromAnyThread(AnchorRegion region) {
+        clientThread.invoke(() -> commitAnchorEdit(region));
+    }
+
+    void commitAnchorEdit(AnchorRegion region) {
+        if (region != null) {
+            AnchorConstraint pinBefore = region.getConstraint();
+            if (!region.isManualPin()) {
+                applyAutoPin(region);
+            }
+            rebaselineOrigin(region);
+            if (pinBefore != region.getConstraint()) {
+                refreshSelectedAnchorProperties(region);
+            }
+        }
+        saveRegions();
     }
 
     /**
@@ -790,15 +781,6 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     /**
-     * AWT-thread-safe entry point for the input listener. Marshals onto the client
-     * thread to match where {@code anchorRegions} is iterated.
-     */
-    public void rebaselineOriginFromAnyThread(AnchorRegion region) {
-        if (region == null) return;
-        clientThread.invoke(() -> rebaselineOrigin(region));
-    }
-
-    /**
      * Recompute a region's live (x, y) from its origin snapshot and the current canvas
      * dim, applying the constraint's directional multiplier:
      *
@@ -814,7 +796,7 @@ public class AnchorCustomizerPlugin extends Plugin {
      * loaded before this field existed). The tick loop seeds those on first valid
      * dim observation.
      */
-    private void recomputePosition(AnchorRegion region, Dimension currentDim) {
+    void recomputePosition(AnchorRegion region, Dimension currentDim) {
         if (region == null || currentDim == null) return;
         int originW = region.getOriginW();
         int originH = region.getOriginH();
@@ -866,7 +848,8 @@ public class AnchorCustomizerPlugin extends Plugin {
                 break;
         }
 
-        region.setX(region.getOriginX() + xShift);
+        region.setX(keepOnCanvas(region.getOriginX() + xShift, region.getWidth(),
+                region.getOriginX(), originW, currentDim.width));
 
         // Pin-to-chat (GitHub issue #17): vertical position tracks the chatbox top
         // instead of the window constraint. X still follows the constraint above.
@@ -887,7 +870,24 @@ public class AnchorCustomizerPlugin extends Plugin {
             return;
         }
 
-        region.setY(region.getOriginY() + yShift);
+        region.setY(keepOnCanvas(region.getOriginY() + yShift, region.getHeight(),
+                region.getOriginY(), originH, currentDim.height));
+    }
+
+    /**
+     * Display-only correction for one axis: a box the user placed fully inside the
+     * window stays fully inside it on a smaller window (one layout is used at every
+     * window size, and a box pinned to the wrong edge would otherwise leave the
+     * canvas where it can't be seen or grabbed). A box the user placed partly outside
+     * the window is left exactly where the pin puts it. The result is never written
+     * back to the origin, so the box returns to its place when the window grows.
+     */
+    static int keepOnCanvas(int pos, int size, int originPos, int originCanvas, int canvas) {
+        boolean insideAtOrigin = originPos >= 0 && originPos + size <= originCanvas;
+        if (!insideAtOrigin) {
+            return pos;
+        }
+        return Math.max(0, Math.min(pos, canvas - size));
     }
 
     /** Gap between items stacked in this box: its own spacing (GitHub issue #30), else the global Stack spacing. */
@@ -901,188 +901,185 @@ public class AnchorCustomizerPlugin extends Plugin {
         return currentChatTop - originChatTop;
     }
 
-    private void loadRegions() {
-        anchorRegions.clear();
-        String json = config.regionJson();
-        if (json == null || json.isEmpty()) {
+    // ---- Layout core -----------------------------------------------------------------
+
+    /**
+     * Load the saved layouts, or build them once from the data older versions saved.
+     * The old keys (regionJson, regionProfiles, overlayAssignments, overlayOrder) are
+     * never written again, so they stay in config as the pre-migration backup.
+     */
+    void loadLayouts() {
+        LayoutStore loaded = LayoutStore.fromJson(gson, config.layoutsJson());
+        boolean migrated = false;
+        if (loaded == null) {
+            loaded = LayoutStore.migrate(gson, config.regionJson(), config.regionProfilesJson(),
+                    config.overlayAssignmentsJson(), config.overlayOrderJson());
+            migrated = true;
+        }
+        store = loaded;
+        legacyPickAttempts = 0;
+        materialize(store.main);
+        liveResolved = false;
+        layoutsDirty = migrated;
+        if (migrated) {
+            events.add("Layouts created from older data: " + layoutSummary());
+        }
+    }
+
+    /** Layouts changed outside this client (another computer through config sync): reload. */
+    private void reloadLayoutsFromConfig() {
+        String json = config.layoutsJson();
+        if (json != null && json.equals(lastWrittenLayoutsJson)) {
             return;
         }
-
-        try {
-            List<AnchorRegion> loaded = gson.fromJson(json, new TypeToken<List<AnchorRegion>>() {
-            }.getType());
-            if (loaded != null) {
-                anchorRegions.addAll(normalizeRegions(loaded));
-            }
-        } catch (Exception e) {
-            log.error("Failed to load regions", e);
-            events.add("ERROR loading anchors: " + e);
+        LayoutStore loaded = LayoutStore.fromJson(gson, json);
+        if (loaded == null) {
+            return;
         }
+        if (inputListener != null) {
+            inputListener.cancelDrag();
+        }
+        boolean fixedWasLive = activeLayout != null && activeLayout.isFixed();
+        store = loaded;
+        // The incoming data wins over anything not yet flushed here.
+        regionsDirty = false;
+        assignmentsDirty = false;
+        orderDirty = false;
+        layoutsDirty = false;
+        materialize(fixedWasLive && store.fixed != null ? store.fixed : store.main);
+        // The next logged-in tick derives positions for this canvas again.
+        liveResolved = false;
+        resetOverlayRuntimeState();
+        requestSnap();
+        events.add("Layouts reloaded (changed outside this client): " + layoutSummary());
+        refreshPanel();
+    }
+
+    /** Replace the live anchors and overlay tables with a deep copy of {@code layout}'s. */
+    private void materialize(AnchorLayout layout) {
+        anchorRegions.clear();
+        overlayAssignments.clear();
+        overlayOrder.clear();
+        activeLayout = layout;
+        if (layout == null) {
+            return;
+        }
+        anchorRegions.addAll(LayoutStore.normalizeRegions(LayoutStore.deepCopy(layout.getRegions())));
+        overlayAssignments.putAll(layout.getAssignments());
+        overlayOrder.putAll(layout.getOrder());
+    }
+
+    /** Write the live anchors and overlay tables back into the active layout object. */
+    private void foldLiveIntoActive() {
+        if (activeLayout == null) {
+            return;
+        }
+        activeLayout.setRegions(LayoutStore.deepCopy(anchorRegions));
+        // Sorted, so the saved JSON only changes when the content does.
+        activeLayout.setAssignments(new java.util.TreeMap<>(overlayAssignments));
+        activeLayout.setOrder(new java.util.TreeMap<>(overlayOrder));
+    }
+
+    /** Overlay tracking derived from the previous layout's assignments; rebuilt by a rescan. */
+    private void resetOverlayRuntimeState() {
+        trackedOverlays.clear();
+        originNormalized.clear();
+        overlayTargets.clear();
+        lastExternalMoveTime.clear();
+        lastUserMoveTime.clear();
+        scanAndReacquireOverlays();
+    }
+
+    /** The layout that should be live right now. Decided by the client mode alone. */
+    private AnchorLayout desiredLayout() {
+        return resizedSupplier.get() ? store.main : store.ensureFixed();
     }
 
     /**
-     * Validate and repair a deserialized region list: null entries dropped, null enums
-     * defaulted, degenerate sizes clamped, duplicate/non-positive IDs reassigned, and
-     * missing names defaulted. Shared by the legacy {@link #loadRegions()} path and the
-     * profile-materialization path so both apply identical hygiene.
+     * Make {@code target} the live layout and derive every anchor position for the
+     * current canvas. Runs on the client thread.
+     *
+     * A layout shown for the first time while another one is on screen starts as a copy
+     * of that one (fixed mode and resizable mode each start from the other's anchors),
+     * held on the canvas and rebaselined; after that the two are independent. Otherwise
+     * the stored origins are left untouched — a position is only rebaselined by a user
+     * edit, never by showing a layout.
      */
-    private List<AnchorRegion> normalizeRegions(List<AnchorRegion> loaded) {
-        List<AnchorRegion> result = new ArrayList<>();
-        Set<Integer> usedIds = new HashSet<>();
-        int nextSyntheticId = 1;
-        for (AnchorRegion r : loaded) {
-            if (r == null) continue;
-            // Normalize null enums (may occur in old persisted data)
-            if (r.getConstraint() == null) r.setConstraint(AnchorConstraint.TOP_LEFT);
-            if (r.getAlignment() == null) r.setAlignment(AnchorAlignment.CENTER);
-            if (r.getStacking() == null) r.setStacking(AnchorStacking.VERTICAL);
-            if (r.getFillDirection() == null) r.setFillDirection(AnchorFillDirection.FORWARD);
-            if (r.getWrapDirection() == null) r.setWrapDirection(AnchorFillDirection.FORWARD);
-
-            // Defensive validation against corrupt/old config data
-            if (r.getWidth() < 10) r.setWidth(10);
-            if (r.getHeight() < 10) r.setHeight(10);
-
-            // De-duplicate IDs: the first occurrence keeps its id; later duplicates
-            // (or non-positive ids) get reassigned to the next free positive int.
-            int id = r.getId();
-            if (id <= 0 || usedIds.contains(id)) {
-                while (usedIds.contains(nextSyntheticId)) nextSyntheticId++;
-                id = nextSyntheticId++;
-                r.setId(id);
-            }
-            usedIds.add(id);
-
-            // Default name if missing, so the list renderer never shows null/empty
-            String name = r.getName();
-            if (name == null || name.isEmpty()) {
-                r.setName("Box " + id);
-            }
-
-            result.add(r);
+    void activateLayout(AnchorLayout target, Dimension currentDim) {
+        // Never carry an in-progress drag across a layout swap — the dragged object
+        // would be orphaned from the new live list.
+        if (inputListener != null) {
+            inputListener.cancelDrag();
         }
-        return result;
-    }
+        AnchorLayout from = activeLayout;
+        boolean switching = from != target;
+        foldLiveIntoActive();
 
-    /** Parse the per-resolution profile map from config. Tolerates missing/corrupt JSON. */
-    private void loadProfiles() {
-        profileLayouts.clear();
-        String json = config.regionProfilesJson();
-        if (json == null || json.isEmpty()) {
-            return;
+        boolean copied = false;
+        if (target.isUnseeded()) {
+            if (switching && from != null && target.getRegions().isEmpty() && !from.getRegions().isEmpty()) {
+                LayoutStore.copyContent(from, target);
+                copied = true;
+            }
+            target.setUnseeded(false);
         }
-        try {
-            Map<String, List<AnchorRegion>> loaded = gson.fromJson(json, new TypeToken<Map<String, List<AnchorRegion>>>() {
-            }.getType());
-            if (loaded != null) {
-                for (Map.Entry<String, List<AnchorRegion>> e : loaded.entrySet()) {
-                    if (e.getKey() != null && e.getValue() != null) {
-                        profileLayouts.put(e.getKey(), e.getValue());
-                    }
+
+        if (switching) {
+            materialize(target);
+            resetOverlayRuntimeState();
+        }
+        liveResolved = true;
+
+        if (currentDim != null && currentDim.width > 0 && currentDim.height > 0) {
+            for (AnchorRegion r : anchorRegions) {
+                recomputePosition(r, currentDim);
+                if (copied) {
+                    clampToCanvas(r, currentDim);
+                    rebaselineOrigin(r);
                 }
             }
-        } catch (Exception e) {
-            log.error("Failed to load region profiles", e);
-            events.add("ERROR loading layout profiles: " + e);
+            if (target.isRepinPending()) {
+                upgradePins(target, currentDim);
+            }
         }
+
+        log.debug("Layout {} -> {} (copied={})", layoutName(from), layoutName(target), copied);
+        events.add((switching ? "Layout " + layoutName(from) + " -> " + layoutName(target)
+                : "Layout shown: " + layoutName(target))
+                + (copied ? " (new, copied from previous)" : "") + ", canvas " + dim(currentDim));
+        saveRegions();
+        layoutsDirty = true;
+        // Layout switches are rare and important — persist now, not on the debounce.
+        flushPendingSaves(true);
+        requestSnap();
+        refreshPanel();
     }
 
     /**
-     * Persist regions immediately. Regions change infrequently (user actions: create,
-     * delete, rename, panel edits, window resize) so we never debounce them — this
-     * guarantees durability even if RuneLite is killed abruptly.
-     *
-     * Fix R2: snapshot the list before serializing so callers on any thread (including
-     * AWT via {@link #saveRegionsFromAnyThread}) can't trip a CME against client-thread
-     * mutations.
+     * One-time upgrade of a layout built from older data. Older versions pinned every
+     * new anchor to the top-left corner unless the user changed it, so such an anchor
+     * keeps its distance to the top-left corner when the canvas size changes — wrong for
+     * a box sitting near another edge. Each anchor still on that default is pinned to
+     * its nearest corner / edge / centre here and rebaselined where it is now, so
+     * nothing moves at the current window size and it adapts correctly from now on.
+     * Pins the user set by hand (anything but top-left) are not touched.
      */
-    public void saveRegions() {
-        List<AnchorRegion> snapshot = new ArrayList<>(anchorRegions);
-        // Legacy "last live layout" snapshot — kept for older plugin versions and as the
-        // startup materialization source before the first logged-in tick resolves a
-        // profile. Note onConfigChanged deliberately no longer reloads from remote
-        // regionJson writes when profiles exist (see there).
-        String json = gson.toJson(snapshot);
-        lastWrittenRegionJson = json;
-        config.setRegionJson(json);
-
-        // Authoritative per-profile storage: fold the live layout back into the active
-        // profile's entry (absolute pixels, deep-copied). The actual config write is
-        // DEBOUNCED via flushPendingSaves — saveRegions runs every tick during a window
-        // resize, and serializing the whole profile map + firing a second ConfigChanged
-        // through the event bus at 50 Hz was measurably costing frame time. The in-memory
-        // map is always current; only the persistence is deferred (and force-flushed on
-        // shutDown / profile switches).
-        if (activeProfileKey != null) {
-            profileLayouts.put(activeProfileKey, deepCopy(snapshot));
+    private void upgradePins(AnchorLayout layout, Dimension currentDim) {
+        int upgraded = 0;
+        for (AnchorRegion r : anchorRegions) {
+            if (r.isManualPin() || r.getConstraint() != AnchorConstraint.TOP_LEFT) {
+                continue;
+            }
+            AnchorConstraint pin = AnchorConstraint.nearest(r.getBounds(), currentDim.width, currentDim.height);
+            if (pin != AnchorConstraint.TOP_LEFT) {
+                r.setConstraint(pin);
+                rebaselineOrigin(r);
+                upgraded++;
+            }
         }
-        profilesDirty = true;
-        regionsDirty = false;
-    }
-
-    // ---- Resolution profile core ----------------------------------------------------
-
-    /**
-     * Deep-copy a region list so the stored layouts never alias live region objects
-     * mutated by the input listener or panel (and vice versa on materialization).
-     */
-    private List<AnchorRegion> deepCopy(List<AnchorRegion> regions) {
-        List<AnchorRegion> out = new ArrayList<>(regions.size());
-        for (AnchorRegion r : regions) {
-            out.add(r.scaledCopy(1.0));
-        }
-        return out;
-    }
-
-    /**
-     * Resolve the current client state to a layout profile key.
-     *
-     * Fixed client mode always maps to the universal {@code "fixed"} profile (canvas is
-     * 765x503 everywhere). Resizable mode is keyed by the monitor's display-mode
-     * resolution — every distinct resolution is its own fully independent profile.
-     * (Deliberately NO integer-factor "family" matching: inferring a scale factor from
-     * monitor resolution ratios corrupted layouts on multi-resolution setups where the
-     * window keeps its pixel size across monitors, and the shared write-back meant
-     * editing on one monitor clobbered its sibling's layout.)
-     *
-     * Returns null when the client state can't be resolved yet (no canvas, no graphics
-     * configuration, degenerate display mode) — callers simply retry next tick.
-     */
-    private String computeProfileMatch() {
-        java.awt.Canvas canvas = client.getCanvas();
-        if (canvas == null) return null;
-        if (!client.isResized()) {
-            return FIXED_PROFILE_KEY;
-        }
-        java.awt.GraphicsConfiguration gc = canvas.getGraphicsConfiguration();
-        if (gc == null) return null;
-        java.awt.DisplayMode dm = gc.getDevice().getDisplayMode();
-        int mw = dm.getWidth();
-        int mh = dm.getHeight();
-        if (mw <= 0 || mh <= 0) return null;
-        return mw + "x" + mh;
-    }
-
-    /**
-     * Keep the screen-change listener attached to the current canvas. The canvas can be
-     * null early in startup or replaced later, so this is re-checked every tick; a newly
-     * watched canvas forces one profile re-check.
-     */
-    private void watchCanvasForDisplayChanges() {
-        java.awt.Canvas canvas = client.getCanvas();
-        if (canvas == watchedCanvas) return;
-        unwatchCanvas();
-        if (canvas != null) {
-            canvas.addPropertyChangeListener("graphicsConfiguration", displayChangeListener);
-        }
-        watchedCanvas = canvas;
-        displayChanged = true;
-    }
-
-    private void unwatchCanvas() {
-        if (watchedCanvas != null) {
-            watchedCanvas.removePropertyChangeListener("graphicsConfiguration", displayChangeListener);
-            watchedCanvas = null;
+        layout.setRepinPending(false);
+        if (upgraded > 0) {
+            events.add("Pinned " + upgraded + " older anchors to their nearest edge (they were on the old top-left default)");
         }
     }
 
@@ -1096,91 +1093,174 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     /**
-     * Swap the live layout to a different profile. Runs on the client thread (called
-     * from onClientTick).
-     *
-     * Steps: fold the outgoing live layout back into its profile entry; materialize the
-     * incoming profile's stored layout as-is (or seed a brand-new profile from the
-     * outgoing layout, scaled once by the OBSERVED canvas dimension change across the
-     * swap — an exact pixel-perfect copy when the window wasn't resized, e.g. a plain
-     * drag to another monitor); derive to the actual canvas; clamp only when seeding
-     * (never fight a layout the user saved deliberately); rebaseline origins; persist;
-     * refresh the panel.
-     *
-     * After the one-time seed a profile is fully independent — edits never propagate
-     * across monitors.
+     * One-time, after the migration from several per-monitor profiles: make the profile
+     * of the monitor in use the layout, so nothing changes on screen on update day. This
+     * is the only place the monitor is still read; the answer is used once.
      */
-    private void switchProfile(String key, Dimension currentDim) {
-        // Never carry an in-progress drag across a layout swap — the dragged object
-        // would be orphaned from the new live list.
-        inputListener.cancelDrag();
-
-        if (activeProfileKey != null) {
-            profileLayouts.put(activeProfileKey, deepCopy(anchorRegions));
+    void resolveLegacyPick() {
+        String key = legacyDisplayKeySupplier.get();
+        if (key == null && ++legacyPickAttempts < LEGACY_PICK_MAX_ATTEMPTS) {
+            return; // no screen info yet; try again next tick
         }
-
-        List<AnchorRegion> stored = profileLayouts.get(key);
-        boolean seeded = (stored == null);
-        List<AnchorRegion> live;
-        if (!seeded) {
-            live = normalizeRegions(deepCopy(stored));
-        } else {
-            // One-time seed: scale by the actual canvas change across this swap
-            // (lastViewport still holds the pre-swap dim here; the tick loop updates
-            // it after we return). Per-axis, since window chrome means maximized
-            // canvases are not exact monitor-ratio multiples. Ratios near 1 collapse
-            // to an exact copy so an un-resized cross-monitor drag stays pixel-perfect.
-            // Only meaningful for a real swap from a live profile — the startup
-            // resolution (activeProfileKey == null) always copies as-is.
-            double fx = 1.0;
-            double fy = 1.0;
-            if (activeProfileKey != null && lastViewport != null
-                    && lastViewport.width > 0 && lastViewport.height > 0) {
-                fx = currentDim.width / (double) lastViewport.width;
-                fy = currentDim.height / (double) lastViewport.height;
-                if (Math.abs(fx - 1.0) < 0.02) fx = 1.0;
-                if (Math.abs(fy - 1.0) < 0.02) fy = 1.0;
-            }
-            live = new ArrayList<>(anchorRegions.size());
-            for (AnchorRegion r : anchorRegions) {
-                live.add(r.scaledCopy(fx, fy));
-            }
+        boolean mainWasLive = activeLayout == store.main;
+        boolean changed = store.pickLegacy(key);
+        layoutsDirty = true;
+        if (changed && mainWasLive) {
+            // Show the picked content; the live anchors were the provisional pick.
+            materialize(store.main);
+            resetOverlayRuntimeState();
+            liveResolved = false;
         }
+        events.add(key == null ? "Layout after update: no screen info, kept the last used old profile"
+                : "Layout after update: monitor " + key
+                        + (changed ? ", switched to its old profile" : ", its old profile was already used (or it has none)"));
+    }
 
-        String fromKey = activeProfileKey;
-        anchorRegions.clear();
-        anchorRegions.addAll(live);
-        activeProfileKey = key;
+    /** The old monitor-profile key ("<W>x<H>" of the monitor's display mode), or null. */
+    private String legacyDisplayKey() {
+        java.awt.Canvas canvas = client.getCanvas();
+        if (canvas == null) return null;
+        java.awt.GraphicsConfiguration gc = canvas.getGraphicsConfiguration();
+        if (gc == null) return null;
+        java.awt.DisplayMode dm = gc.getDevice().getDisplayMode();
+        if (dm == null || dm.getWidth() <= 0 || dm.getHeight() <= 0) return null;
+        return dm.getWidth() + "x" + dm.getHeight();
+    }
 
-        for (AnchorRegion r : anchorRegions) {
-            recomputePosition(r, currentDim);
-            if (seeded) {
-                clampToCanvas(r, currentDim);
-            }
-            rebaselineOrigin(r);
+    /** Tell a user who had several monitor profiles, once, that there is now one layout. */
+    void showPendingNotice() {
+        if (!store.noticePending) {
+            return;
         }
+        store.noticePending = false;
+        layoutsDirty = true;
+        try {
+            noticeHandler.accept("Custom UI Anchors now uses one layout on every monitor. Your other old "
+                    + "monitor layouts are in the side panel: Export / Import > Restore old layout.");
+        } catch (RuntimeException e) {
+            log.debug("Could not show the layout notice", e);
+        }
+    }
 
-        log.debug("Switched layout profile {} -> {} (seeded={})", fromKey, key, seeded);
-        events.add("Layout profile " + fromKey + " -> " + key + (seeded ? " (new, copied from previous)" : "")
-                + ", canvas " + dim(currentDim));
-        saveRegions();
-        // Profile swaps are rare and important — persist immediately rather than waiting
-        // for the debounced flush.
+    /**
+     * Replace the resizable-mode layout with one of the old layouts (an old monitor
+     * profile, or the layout replaced by the previous restore). The layout being
+     * replaced is kept, so one restore can always be undone from the same menu.
+     */
+    public void restoreOldLayout(String oldId) {
+        clientThread.invoke(() -> restoreOldLayoutOnClientThread(oldId));
+    }
+
+    void restoreOldLayoutOnClientThread(String oldId) {
+        if (inputListener != null) {
+            inputListener.cancelDrag();
+        }
+        foldLiveIntoActive();
+        AnchorLayout source = store.old(oldId);
+        String name = layoutName(source);
+        if (!store.restore(oldId)) {
+            return;
+        }
+        store.legacyPickPending = false;
+        layoutsDirty = true;
+        if (activeLayout == store.main) {
+            materialize(store.main);
+            resetOverlayRuntimeState();
+            // The next logged-in tick derives positions for this canvas.
+            liveResolved = false;
+            requestSnap();
+        }
+        events.add("Restored old layout " + name + ": " + store.main.getRegions().size() + " anchors");
         flushPendingSaves(true);
-        requestSnap();
+        refreshPanel();
+    }
 
+    private static String layoutName(AnchorLayout l) {
+        return l == null ? "none" : l.getName();
+    }
+
+    /** "Layout=7, Fixed mode=3, old: 1920x1080=4" — every stored layout with its anchor count. */
+    private String layoutSummary() {
+        List<String> parts = new ArrayList<>();
+        if (store.main != null) {
+            parts.add(layoutCount(store.main));
+        }
+        if (store.fixed != null) {
+            parts.add(layoutCount(store.fixed));
+        }
+        for (AnchorLayout l : store.oldLayouts) {
+            parts.add("old: " + layoutCount(l));
+        }
+        return parts.isEmpty() ? "none" : String.join(", ", parts);
+    }
+
+    private String layoutCount(AnchorLayout l) {
+        return l.getName() + "=" + (l == activeLayout ? anchorRegions.size() : l.getRegions().size());
+    }
+
+    /** Push the anchor list, the anchor selection and the restorable old layouts to the side panel. */
+    private void refreshPanel() {
         final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
         final int selectedId = config.selectedRegionId();
+        final List<String> oldIds = new ArrayList<>();
+        final List<String> oldLabels = new ArrayList<>();
+        for (AnchorLayout l : store.oldLayouts) {
+            int n = l.getRegions().size();
+            oldIds.add(l.getId());
+            oldLabels.add(l.getName() + " (" + n + (n == 1 ? " anchor)" : " anchors)"));
+        }
         SwingUtilities.invokeLater(() -> {
             if (panel == null) return;
+            panel.updateOldLayouts(oldIds, oldLabels);
             panel.updateList(snap);
+            // Also clears a selection the shown layout does not contain.
+            AnchorRegion sel = null;
             for (AnchorRegion r : snap) {
                 if (r.getId() == selectedId) {
-                    panel.setSelectedRegion(r);
+                    sel = r;
                     break;
                 }
             }
+            panel.setSelectedRegion(sel);
         });
+    }
+
+    // ---- Saving -----------------------------------------------------------------------
+
+    /**
+     * Record that the live anchors changed. {@link #flushPendingSaves} folds the live
+     * state into the active layout and writes it to config; it runs every client tick
+     * (debounced) and is forced on shutdown and on layout switches, so this is cheap
+     * enough to call on every tick of a window resize.
+     */
+    public void saveRegions() {
+        regionsDirty = true;
+    }
+
+    /**
+     * Write the layouts to config when something changed. Debounced: anchor positions
+     * change every tick during a window resize and overlay assignments can churn during
+     * capture-phase drags (up to ~50 Hz). Force-flush on shutDown and layout switches.
+     */
+    void flushPendingSaves(boolean force) {
+        if (!regionsDirty && !assignmentsDirty && !orderDirty && !layoutsDirty) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!force && (now - lastFlushTime) < SAVE_DEBOUNCE_MS) {
+            return;
+        }
+        foldLiveIntoActive();
+        String json = store.toJson(gson);
+        regionsDirty = false;
+        assignmentsDirty = false;
+        orderDirty = false;
+        layoutsDirty = false;
+        lastFlushTime = now;
+        if (!json.equals(lastWrittenLayoutsJson)) {
+            lastWrittenLayoutsJson = json;
+            config.setLayoutsJson(json);
+        }
     }
 
     /**
@@ -1206,42 +1286,6 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     /**
-     * Flush pending assignment writes. Assignments can churn during capture-phase
-     * drags (up to ~50 Hz), so they are debounced on the tick loop. Force-flush on
-     * shutDown to guarantee persistence.
-     */
-    private void flushPendingSaves(boolean force) {
-        long now = System.currentTimeMillis();
-        if (!force && (now - lastFlushTime) < SAVE_DEBOUNCE_MS) {
-            return;
-        }
-        if (regionsDirty) {
-            // Defensive: should normally be false because saveRegions writes immediately,
-            // but flush anything still marked dirty just in case.
-            saveRegions();
-        }
-        if (assignmentsDirty) {
-            String json = gson.toJson(overlayAssignments);
-            lastWrittenAssignmentsJson = json;
-            config.setOverlayAssignmentsJson(json);
-            assignmentsDirty = false;
-        }
-        if (orderDirty) {
-            String json = gson.toJson(overlayOrder);
-            lastWrittenOrderJson = json;
-            config.setOverlayOrderJson(json);
-            orderDirty = false;
-        }
-        if (profilesDirty) {
-            String json = gson.toJson(profileLayouts);
-            lastWrittenProfilesJson = json;
-            config.setRegionProfilesJson(json);
-            profilesDirty = false;
-        }
-        lastFlushTime = now;
-    }
-
-    /**
      * Returns an immutable snapshot of the current anchor regions. The underlying list
      * is mutated only on the client thread; callers on other threads (AWT mouse handlers,
      * overlay-manager callbacks) iterate this snapshot safely without risk of
@@ -1252,9 +1296,9 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     public Rectangle getViewportBounds() {
-        if (client.getCanvas() == null)
+        Dimension dim = canvasDimSupplier.get();
+        if (dim == null)
             return null;
-        Dimension dim = client.getRealDimensions();
 
         // Use logic similar to old getViewportBounds but simplified as we might treat
         // canvas as whole
@@ -1320,24 +1364,18 @@ public class AnchorCustomizerPlugin extends Plugin {
                 }
 
                 if (!inStartupGrace && loggedIn) {
-                    // Resolve the layout profile (fixed mode / monitor resolution) and swap
-                    // layouts when it changes — first logged-in tick, fixed/resizable
-                    // toggles, and cross-monitor moves all land here. switchProfile
-                    // derives, clamps (seed only), rebaselines and persists, so the
-                    // rest of this tick can be skipped for this pass.
-                    //
-                    // Only re-check when unresolved, when the canvas dim moved (mode
-                    // toggles and cross-DPI monitor drags always change it), or when AWT
-                    // reports the canvas moved to another screen (same-dim monitor swaps).
-                    watchCanvasForDisplayChanges();
-                    boolean checkProfile = activeProfileKey == null
-                            || !lastViewport.equals(currentDim)
-                            || displayChanged;
-                    if (checkProfile) {
-                        displayChanged = false;
-                        String matchKey = computeProfileMatch();
-                        if (matchKey != null && !matchKey.equals(activeProfileKey)) {
-                            switchProfile(matchKey, currentDim);
+                    // Show the layout for the current client mode: on the first
+                    // logged-in tick, and on a fixed/resizable toggle. activateLayout
+                    // derives every position for this canvas and persists, so the rest
+                    // of this tick is skipped.
+                    if (store.legacyPickPending) {
+                        resolveLegacyPick();
+                    }
+                    if (!store.legacyPickPending) {
+                        AnchorLayout desired = desiredLayout();
+                        if (desired != null && (desired != activeLayout || !liveResolved)) {
+                            activateLayout(desired, currentDim);
+                            showPendingNotice();
                             lastViewport = currentDim;
                             snapAndStackOverlays(true);
                             flushPendingSaves(false);
@@ -2492,41 +2530,6 @@ public class AnchorCustomizerPlugin extends Plugin {
     private static final String SNAP_CORNER_OVERLAY_FQN =
             "net.runelite.client.ui.overlay.SnapCorner$CornerOverlay";
 
-    private void loadOverlayOrder() {
-        String json = config.overlayOrderJson();
-        if (json == null || json.isEmpty()) {
-            return;
-        }
-        try {
-            Map<String, Integer> loaded = gson.fromJson(json, new TypeToken<Map<String, Integer>>() {
-            }.getType());
-            if (loaded != null) {
-                overlayOrder.clear();
-                overlayOrder.putAll(loaded);
-            }
-        } catch (Exception e) {
-            log.error("Failed to load overlay order", e);
-            events.add("ERROR loading overlay order: " + e);
-        }
-    }
-
-    private void loadOverlayAssignments() {
-        String json = config.overlayAssignmentsJson();
-        if (json == null || json.isEmpty())
-            return;
-        try {
-            Map<String, Integer> loaded = gson.fromJson(json, new TypeToken<Map<String, Integer>>() {
-            }.getType());
-            if (loaded != null) {
-                overlayAssignments.clear();
-                overlayAssignments.putAll(loaded);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to load overlay assignments", e);
-            events.add("ERROR loading overlay assignments: " + e);
-        }
-    }
-
     /**
      * Returns true if there is any movable RuneLite overlay (other than our own
      * customizer overlay) whose drawn bounds contain {@code p}.
@@ -2785,24 +2788,22 @@ public class AnchorCustomizerPlugin extends Plugin {
 
     // ---- Clipboard export/import (GitHub issue #23) ----------------------------------
     //
-    // The layout is exported as a small JSON envelope around the four raw config blobs,
-    // so an import is just a validated write-back followed by the normal load paths.
-
-    private static final String EXPORT_FORMAT = "custom-ui-anchors";
-    private static final int EXPORT_VERSION = 1;
+    // The export is a small JSON envelope around the stored layouts (LayoutStore.toExport).
+    // An import replaces them all; exports from the per-monitor profile era (the four raw
+    // config blobs) go through the same migration as an in-place upgrade.
 
     /**
-     * Serialize the current layout (regions, resolution profiles, overlay assignments and
-     * ordering) to the export JSON envelope. Marshals onto the client thread to flush any
-     * pending debounced saves first so the export can't miss an unflushed edit; blocks the
-     * caller (the panel's EDT) briefly until it completes. Returns null on failure.
+     * Serialize the layouts to the export JSON envelope. Marshals onto the client thread
+     * so the live anchors are folded in first and the export can't miss an unsaved edit;
+     * blocks the caller (the panel's EDT) briefly until it completes. Returns null on
+     * failure.
      */
     public String exportLayoutJson() {
         final CompletableFuture<String> result = new CompletableFuture<>();
         clientThread.invoke(() -> {
             try {
                 flushPendingSaves(true);
-                result.complete(buildExportJson(gson, config));
+                result.complete(buildExportJson(gson));
             } catch (Throwable t) {
                 result.completeExceptionally(t);
             }
@@ -2815,29 +2816,9 @@ public class AnchorCustomizerPlugin extends Plugin {
         }
     }
 
-    static String buildExportJson(Gson gson, AnchorCustomizerConfig config) {
-        JsonObject root = new JsonObject();
-        root.addProperty("format", EXPORT_FORMAT);
-        root.addProperty("version", EXPORT_VERSION);
-        root.add("regionJson", parseJsonOr(gson, config.regionJson(), "[]"));
-        root.add("regionProfiles", parseJsonOr(gson, config.regionProfilesJson(), "{}"));
-        root.add("overlayAssignments", parseJsonOr(gson, config.overlayAssignmentsJson(), "{}"));
-        root.add("overlayOrder", parseJsonOr(gson, config.overlayOrderJson(), "{}"));
-        return gson.toJson(root);
-    }
-
-    private static JsonElement parseJsonOr(Gson gson, String json, String fallback) {
-        if (json != null) {
-            try {
-                JsonElement el = gson.fromJson(json, JsonElement.class);
-                if (el != null && !el.isJsonNull()) {
-                    return el;
-                }
-            } catch (Exception ignored) {
-                // fall through to the fallback blob
-            }
-        }
-        return gson.fromJson(fallback, JsonElement.class);
+    String buildExportJson(Gson g) {
+        foldLiveIntoActive();
+        return g.toJson(store.toExport(g));
     }
 
     /**
@@ -2854,12 +2835,12 @@ public class AnchorCustomizerPlugin extends Plugin {
         } catch (Exception e) {
             return "The clipboard contents are not valid JSON.";
         }
-        if (!el.isJsonObject()) {
+        if (el == null || !el.isJsonObject()) {
             return "The clipboard contents are not a Custom UI Anchors layout.";
         }
         JsonObject root = el.getAsJsonObject();
         JsonElement format = root.get("format");
-        if (format == null || !format.isJsonPrimitive() || !EXPORT_FORMAT.equals(format.getAsString())) {
+        if (format == null || !format.isJsonPrimitive() || !LayoutStore.EXPORT_FORMAT.equals(format.getAsString())) {
             return "The clipboard contents are not a Custom UI Anchors layout.";
         }
         JsonElement version = root.get("version");
@@ -2869,16 +2850,16 @@ public class AnchorCustomizerPlugin extends Plugin {
         } catch (RuntimeException e) {
             v = -1;
         }
-        if (v < 0 || v > EXPORT_VERSION) {
+        if (v < 0 || v > LayoutStore.EXPORT_VERSION) {
             return "This layout was exported by a newer version of the plugin and cannot be imported.";
         }
         return null;
     }
 
     /**
-     * Apply a validated layout export, replacing ALL anchors, profiles and overlay
-     * assignments in the current RuneLite profile. Marshals the mutation onto the client
-     * thread (where anchorRegions is iterated); the panel list is refreshed on the EDT.
+     * Apply a validated layout export, replacing ALL anchors and overlay assignments in
+     * the current RuneLite profile. Marshals the mutation onto the client thread (where
+     * anchorRegions is iterated); the panel is refreshed on the EDT.
      */
     public void applyLayoutImport(String json) {
         final JsonObject root = gson.fromJson(json, JsonElement.class).getAsJsonObject();
@@ -2886,63 +2867,37 @@ public class AnchorCustomizerPlugin extends Plugin {
     }
 
     void applyLayoutImportOnClientThread(JsonObject root) {
-        String regions = childJsonString(root, "regionJson", "[]");
-        String profiles = childJsonString(root, "regionProfiles", "{}");
-        String assignments = childJsonString(root, "overlayAssignments", "{}");
-        String order = childJsonString(root, "overlayOrder", "{}");
+        if (inputListener != null) {
+            inputListener.cancelDrag();
+        }
+        boolean fixedWasLive = activeLayout != null && activeLayout.isFixed();
+        store = LayoutStore.fromExport(gson, root);
+        legacyPickAttempts = 0;
 
-        // Record the written strings before the setters fire ConfigChanged so the
-        // self-suppression in onConfigChanged ignores our own writes.
-        lastWrittenRegionJson = regions;
-        config.setRegionJson(regions);
-        lastWrittenProfilesJson = profiles;
-        config.setRegionProfilesJson(profiles);
-        lastWrittenAssignmentsJson = assignments;
-        config.setOverlayAssignmentsJson(assignments);
-        lastWrittenOrderJson = order;
-        config.setOverlayOrderJson(order);
-
-        // Drop all runtime state derived from the previous layout, then re-run the
-        // normal load path so the imported data flows through the same hygiene.
-        activeProfileKey = null;
-        profileLayouts.clear();
-        trackedOverlays.clear();
-        originNormalized.clear();
-        overlayTargets.clear();
-        lastExternalMoveTime.clear();
-        lastUserMoveTime.clear();
-
-        loadRegions();
-        loadProfiles();
-        loadOverlayAssignments();
-        loadOverlayOrder();
-        scanAndReacquireOverlays();
+        // Drop all runtime state derived from the previous layouts and show the imported
+        // one; the next logged-in tick derives positions for this canvas (and, for an
+        // old export holding several monitor profiles, picks this monitor's).
+        activeLayout = null;
+        materialize(fixedWasLive && store.fixed != null ? store.fixed : store.main);
+        liveResolved = false;
+        resetOverlayRuntimeState();
+        layoutsDirty = true;
+        flushPendingSaves(true);
         requestSnap();
-        events.add("Imported a layout: " + anchorRegions.size() + " anchors, " + overlayAssignments.size()
-                + " assigned overlays");
-
-        final List<AnchorRegion> snap = new ArrayList<>(anchorRegions);
-        SwingUtilities.invokeLater(() -> {
-            if (panel != null) {
-                panel.updateList(snap);
-            }
-        });
-    }
-
-    private String childJsonString(JsonObject root, String key, String fallback) {
-        JsonElement el = root.get(key);
-        return el == null || el.isJsonNull() ? fallback : gson.toJson(el);
+        events.add("Imported a layout (" + layoutSummary() + "): " + anchorRegions.size() + " anchors, "
+                + overlayAssignments.size() + " assigned overlays");
+        refreshPanel();
     }
 
     // ---- Diagnostics: "Copy diagnostics" / "Report issue on GitHub" -------------------
     //
     // One report with what past GitHub issues kept asking for: versions, monitors and
-    // scaling, the layout profile, settings, other plugins, every anchor, every anchored
+    // scaling, the layouts, settings, other plugins, every anchor, every anchored
     // overlay (live state and what RuneLite saved for it), the saved layout, and the
     // recent events. Read-only; nothing leaves the machine unless the user pastes it.
 
     private static final Set<String> INTERNAL_CONFIG_KEYS = new HashSet<>(java.util.Arrays.asList(
-            "regionJson", "regionProfiles", "overlayAssignments", "overlayOrder", "selectedRegionId"));
+            "layouts", "regionJson", "regionProfiles", "overlayAssignments", "overlayOrder", "selectedRegionId"));
 
     // Enabled plugins whose names match these have interfered with anchors in past issues
     // (renderers, cursor plugins, chat and infobox plugins, stretched mode).
@@ -3018,8 +2973,9 @@ public class AnchorCustomizerPlugin extends Plugin {
                 + (client.isStretchedEnabled() ? ", stretched to " + dim(client.getStretchedDimensions()) : "")
                 + ", " + client.getGameState());
         summary.put("Window", windowDescription(canvas, windowDevice));
-        summary.put("Layout profile", (activeProfileKey != null ? activeProfileKey : "not chosen yet (chosen after login)")
-                + ", stored: " + profileSummary());
+        summary.put("Layout", layoutName(activeLayout)
+                + (liveResolved ? "" : " (positions not derived yet: that happens after login)")
+                + ", all layouts: " + layoutSummary());
         summary.put("Drag hotkey", runeLiteConfig != null ? String.valueOf(runeLiteConfig.dragHotkey()) : "?");
         summary.put("Settings", "Show anchors " + config.anchorVisibility()
                 + ", render over interfaces " + config.drawAboveInterfaces()
@@ -3041,7 +2997,7 @@ public class AnchorCustomizerPlugin extends Plugin {
         JsonArray plugins = new JsonArray();
         enabledPlugins.forEach(plugins::add);
         sections.put("Enabled plugins (" + enabledPlugins.size() + ")", g.toJson(plugins));
-        sections.put("Saved layout (importable with Import layout)", buildExportJson(g, config));
+        sections.put("Saved layouts (importable with Import layout)", buildExportJson(g));
 
         Map<String, String> redactions = new LinkedHashMap<>();
         String home = System.getProperty("user.home");
@@ -3099,17 +3055,6 @@ public class AnchorCustomizerPlugin extends Plugin {
         boolean maximized = window instanceof Frame
                 && (((Frame) window).getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
         return rect(b) + (maximized ? ", maximized" : "") + (device != null ? ", on " + device.getIDstring() : "");
-    }
-
-    private String profileSummary() {
-        if (profileLayouts.isEmpty()) {
-            return "none";
-        }
-        List<String> parts = new ArrayList<>();
-        for (Map.Entry<String, List<AnchorRegion>> e : new java.util.TreeMap<>(profileLayouts).entrySet()) {
-            parts.add(e.getKey() + "=" + e.getValue().size());
-        }
-        return String.join(", ", parts);
     }
 
     private static JsonArray displaysJson(GraphicsDevice windowDevice) {

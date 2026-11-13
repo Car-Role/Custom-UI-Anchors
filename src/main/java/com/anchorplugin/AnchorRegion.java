@@ -87,6 +87,12 @@ public class AnchorRegion {
     // when writing, so existing layouts are unchanged.
     private Integer spacing = null;
 
+    // False (the default, and what Gson yields for older data) = the plugin picks the
+    // constraint: when the user drops or moves the box, it is pinned to the nearest
+    // corner / edge / centre of the game window. True = the user picked the constraint
+    // in the side panel and it must be left alone.
+    private volatile boolean manualPin = false;
+
     // Helper to get bounds as AWT Rectangle. Snapshots the four volatile fields in a
     // single call so callers get a self-consistent rectangle (still possible for x/y
     // vs width/height to be read across a drag update, but the worst case is a
@@ -128,6 +134,7 @@ public class AnchorRegion {
                 wrapDirection,
                 pinToChat,
                 (int) Math.round(originChatTop * fy),
-                spacing);
+                spacing,
+                manualPin);
     }
 }

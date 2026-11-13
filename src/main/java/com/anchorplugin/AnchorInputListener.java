@@ -238,12 +238,10 @@ public class AnchorInputListener implements MouseListener {
             draggedAnchor = null;
             isResizing = false;
             resizeDirection = 0;
-            if (confirmed != null) {
-                plugin.rebaselineOriginFromAnyThread(confirmed);
-            }
-            // Fix R1: marshal the persistence write onto the client thread so it can't
-            // race against create/delete/load of anchorRegions from other paths.
-            plugin.saveRegionsFromAnyThread();
+            // Pin (automatic unless the user set one), rebaseline and save — marshalled
+            // onto the client thread (Fix R1) so it can't race against create/delete/load
+            // of anchorRegions from other paths.
+            plugin.commitAnchorEditFromAnyThread(confirmed);
             e.consume();
         }
         // If the hotkey is no longer held (e.g. the user released Alt mid-drag and then
